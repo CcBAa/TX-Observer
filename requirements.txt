@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TX-Observer  |  Python dependencies
+# Tested with Python 3.9 – 3.12
+# Install: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Environment / configuration
+python-dotenv>=1.0.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Chart rendering  (headless — no GUI required)
+mplfinance>=0.12.10b0
+matplotlib>=3.7.0
+
+# HTTP client
+# Used for: Imgbb upload API + LINE Messaging API push
+requests>=2.28.0
+
+# Scheduler
+APScheduler>=3.10.0
+
+# Timezone support
+pytz>=2023.3
