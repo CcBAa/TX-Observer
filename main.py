@@ -54,9 +54,9 @@ from renderer import render_chart                           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-# 480 one-minute bars = 8 hours of data
-# → gives ~8 usable 60K bars and ~96 usable 5K bars
-_FETCH_PERIODS_1MIN = 480
+# 1200 one-minute bars = 20 hours of data
+# → gives ~20 usable 60K bars and ~240 usable 5K bars (sufficient for MA240 on 5K)
+_FETCH_PERIODS_1MIN = 1200
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@ _MARKET_COLORS = mpf.make_marketcolors(
 _DARK_STYLE = mpf.make_mpf_style(
     base_mpf_style="nightclouds",
     marketcolors=_MARKET_COLORS,
-    mavcolors=["#FFD700", "#00BFFF", "#FF69B4"],   # MA5=gold, MA10=dodger blue, MA20=hot pink
+    mavcolors=["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#C0C0C0"],   # MA5=gold, MA10=dodger blue, MA20=hot pink, MA60=orange, MA240=silver
     gridstyle="--",
     gridcolor="#2a2a3e",
     facecolor="#0d1117",        # Axes background
@@ -113,10 +113,10 @@ def render_chart(
             f"DataFrame has only {len(df_plot)} row(s); at least 3 are required to render a chart."
         )
 
-    # Warn if not enough bars for MA20
-    if len(df_plot) < 20:
+    # Warn if not enough bars for MA240
+    if len(df_plot) < 240:
         logger.warning(
-            "Only %d bars available — MA20 will be incomplete (need >= 20).",
+            "Only %d bars available — MA240 will be incomplete (need >= 240).",
             len(df_plot),
         )
 
@@ -136,7 +136,7 @@ def render_chart(
     )
     title_line2 = (
         f"Generated: {now_tw.strftime('%Y-%m-%d %H:%M')} (UTC+8)  "
-        f"|  MA: 5 (gold)  10 (blue)  20 (pink)"
+        f"|  MA: 5 (gold)  10 (blue)  20 (pink)  60 (orange)  240 (silver)"
     )
     title = f"{title_line1}\n{title_line2}"
 
@@ -149,7 +149,7 @@ def render_chart(
             type="candle",
             style=_DARK_STYLE,
             title=title,
-            mav=(5, 10, 20),
+            mav=(5, 10, 20, 60, 240),
             volume=True,
             figsize=(18, 10),
             savefig={"fname": str(filepath), "dpi": 150, "bbox_inches": "tight"},

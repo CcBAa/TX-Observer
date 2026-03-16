@@ -1,0 +1,9 @@
+{
+  "source_directories": [
+    {
+      "root": "."
+    }
+  ],
+  "python_version": "3.11",
+  "strict": false
+}
