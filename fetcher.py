@@ -9,12 +9,13 @@ Symbol resolution:
   Rolls to the next month after the 3rd Wednesday (settlement day).
 
 Data strategy:
-  Uses the historical candles endpoint with a 7-day lookback window so that
-  the result spans multiple sessions — enough bars for MA240 on the 5K chart.
+  Uses the intraday candles endpoint (current session only).
+  Available bar count grows as the session progresses; MA lines will
+  appear gradually (MA240 on 5K requires ~1200 bars = full session).
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta  # timedelta used in _third_wednesday
 
 import pandas as pd
 import pytz
@@ -55,7 +56,8 @@ class FugleDataFetcher:
         """
         Fetch the latest *periods* 1-minute bars for the TX near-month contract.
 
-        Looks back up to 7 calendar days to ensure enough bars across sessions.
+        Uses the intraday endpoint (current session only); the number of
+        available bars depends on how much of the session has elapsed.
 
         Parameters
         ----------
@@ -72,23 +74,16 @@ class FugleDataFetcher:
         RuntimeError
             If the API returns no data or an unexpected response.
         """
-        now     = datetime.now(tz=TW_TZ)
-        symbol  = _get_near_month_symbol(now)
-        date_from = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        date_to   = now.strftime("%Y-%m-%d")
+        now    = datetime.now(tz=TW_TZ)
+        symbol = _get_near_month_symbol(now)
 
-        logger.info(
-            "Fetching 1-min bars: symbol=%s  from=%s  to=%s",
-            symbol, date_from, date_to,
-        )
+        logger.info("Fetching intraday 1-min bars: symbol=%s", symbol)
 
         try:
-            response = self._client.futopt.historical.candles(**{
-                "symbol":    symbol,
-                "from":      date_from,
-                "to":        date_to,
-                "timeframe": "1",
-            })
+            response = self._client.futopt.intraday.candles(
+                symbol=symbol,
+                timeframe="1",
+            )
         except Exception as exc:
             raise RuntimeError(f"Fugle API request failed: {exc}") from exc
 
