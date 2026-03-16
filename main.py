@@ -36,6 +36,7 @@ from typing import Optional
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 # Bootstrap logging BEFORE importing project modules so all child loggers
 # inherit the same console + file handlers.
@@ -127,13 +128,14 @@ def run_job() -> None:
     logger.info("─── Job triggered at %s (UTC+8) ───", now.strftime("%Y-%m-%d %H:%M:%S"))
 
     # ── Trading-hours gate ─────────────────────────────────────────────────
-    if not is_trading_time(now):
-        logger.info(
-            "Outside trading hours (%s %s) — job skipped.",
-            now.strftime("%A"),
-            now.strftime("%H:%M"),
-        )
-        return
+    # NOTE: gate disabled for testing — re-enable before production
+    # if not is_trading_time(now):
+    #     logger.info(
+    #         "Outside trading hours (%s %s) — job skipped.",
+    #         now.strftime("%A"),
+    #         now.strftime("%H:%M"),
+    #     )
+    #     return
 
     # ── Credentials ────────────────────────────────────────────────────────
     try:
@@ -248,33 +250,41 @@ def build_scheduler() -> BlockingScheduler:
         replace_existing=True,
     )
 
-    # Trigger A: weekday session snapshots
+    # NOTE: testing mode — fires every 1 minute
     scheduler.add_job(
         **_common,
-        trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour="9,11,13,15,21,23",
-            minute=0,
-            second=0,
-            timezone=TW_TZ,
-        ),
-        id="tx_weekday_sessions",
-        name="TX Observer — weekday session snapshots",
+        trigger=IntervalTrigger(minutes=1, timezone=TW_TZ),
+        id="tx_test_interval",
+        name="TX Observer — test (every 1 min)",
     )
 
-    # Trigger B: night-session close (early morning)
-    scheduler.add_job(
-        **_common,
-        trigger=CronTrigger(
-            day_of_week="tue-sat",
-            hour=5,
-            minute=0,
-            second=0,
-            timezone=TW_TZ,
-        ),
-        id="tx_night_close",
-        name="TX Observer — night session close (05:00)",
-    )
+    # ---- production triggers (re-enable when done testing) ----
+    # # Trigger A: weekday session snapshots
+    # scheduler.add_job(
+    #     **_common,
+    #     trigger=CronTrigger(
+    #         day_of_week="mon-fri",
+    #         hour="9,11,13,15,21,23",
+    #         minute=0,
+    #         second=0,
+    #         timezone=TW_TZ,
+    #     ),
+    #     id="tx_weekday_sessions",
+    #     name="TX Observer — weekday session snapshots",
+    # )
+    # # Trigger B: night-session close (early morning)
+    # scheduler.add_job(
+    #     **_common,
+    #     trigger=CronTrigger(
+    #         day_of_week="tue-sat",
+    #         hour=5,
+    #         minute=0,
+    #         second=0,
+    #         timezone=TW_TZ,
+    #     ),
+    #     id="tx_night_close",
+    #     name="TX Observer — night session close (05:00)",
+    # )
 
     return scheduler
 
@@ -321,8 +331,7 @@ def main() -> None:
 
     scheduler = build_scheduler()
     logger.info(
-        "Scheduler started. Triggers: "
-        "Mon–Fri @ 09/11/13/15/21/23:00  |  Tue–Sat @ 05:00  (UTC+8). "
+        "Scheduler started. [TEST MODE] Trigger: every 1 minute. "
         "Press Ctrl+C to stop."
     )
 
