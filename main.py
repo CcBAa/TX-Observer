@@ -45,7 +45,7 @@ from config import get_credentials, setup_logging
 logger = setup_logging()
 
 # Project modules (imported after logging is configured)
-from fetcher import MockDataFetcher                          # noqa: E402
+from fetcher import FugleDataFetcher                         # noqa: E402
 from notifier import send_push_message, upload_to_imgbb     # noqa: E402
 from renderer import render_chart                           # noqa: E402
 
@@ -144,9 +144,10 @@ def run_job() -> None:
         logger.error("Credential error — job aborted:\n%s", exc)
         return
 
-    line_token = creds["LINE_CHANNEL_ACCESS_TOKEN"]
-    target_id  = creds["LINE_TARGET_ID"]
-    imgbb_key  = creds["IMGBB_API_KEY"]
+    line_token  = creds["LINE_CHANNEL_ACCESS_TOKEN"]
+    target_id   = creds["LINE_TARGET_ID"]
+    imgbb_key   = creds["IMGBB_API_KEY"]
+    fugle_token = creds["FUGLE_API_TOKEN"]
 
     # Paths tracked here so the finally block can always clean up
     chart_60k_path: Optional[Path] = None
@@ -154,14 +155,14 @@ def run_job() -> None:
 
     try:
         # ── Fetch ──────────────────────────────────────────────────────────
-        logger.info("Fetching %d 1-minute bars...", _FETCH_PERIODS_1MIN)
-        fetcher = MockDataFetcher()
+        logger.info("Fetching %d 1-minute bars via Fugle API...", _FETCH_PERIODS_1MIN)
+        fetcher = FugleDataFetcher(api_key=fugle_token)
         df_1min = fetcher.fetch_1min_bars(periods=_FETCH_PERIODS_1MIN)
 
         # ── Resample ───────────────────────────────────────────────────────
         logger.info("Resampling → 5min and 60min...")
-        df_5k  = MockDataFetcher.resample_to_timeframe(df_1min, "5min")
-        df_60k = MockDataFetcher.resample_to_timeframe(df_1min, "60min")
+        df_5k  = FugleDataFetcher.resample_to_timeframe(df_1min, "5min")
+        df_60k = FugleDataFetcher.resample_to_timeframe(df_1min, "60min")
 
         # ── Price summary ──────────────────────────────────────────────────
         latest_close = float(df_1min["Close"].iloc[-1])
