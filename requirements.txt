@@ -13,7 +13,7 @@ numpy>=1.24.0
 
 # Chart rendering  (headless — no GUI required)
 mplfinance>=0.12.10b0
-matplotlib>=3.7.0
+matplotlib>=3.7.3
 
 # HTTP client
 # Used for: Imgbb upload API + LINE Messaging API push
