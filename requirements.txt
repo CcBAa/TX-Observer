@@ -4,8 +4,8 @@
 # Environment / configuration
 python-dotenv>=1.0.0
 
-# Fugle Market Data API (台指期即時行情)
-fugle-marketdata>=1.0.0
+# Market data — Yahoo Finance (台指期 WTX=F)
+yfinance>=0.2.40
 
 # Data handling
 pandas>=2.0.0

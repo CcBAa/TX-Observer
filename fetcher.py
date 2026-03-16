@@ -1,51 +1,52 @@
 """
 fetcher.py — Data fetching and resampling for TX-Observer.
 
-Fetches real TX Futures (台指期近月) 1-minute OHLCV bars from the
-Fugle Market Data API (富果行情 API) via fugle-marketdata SDK.
+Fetches TX Futures (台指期) 1-minute OHLCV bars from Yahoo Finance
+using the symbol WTX=F (near-month contract).
 
-Symbol resolution:
-  TX near-month symbol is determined automatically (e.g. TXFC6 for Mar 2026).
-  Rolls to the next month after the 3rd Wednesday (settlement day).
+Limitations:
+  yfinance 1m interval supports a maximum 7-day lookback window.
+  Available bar count depends on how many sessions fall within that window.
+  MA lines requiring more bars (e.g. MA240 on 5K) will appear gradually.
 
-Data strategy:
-  Uses the intraday candles endpoint (current session only).
-  Available bar count grows as the session progresses; MA lines will
-  appear gradually (MA240 on 5K requires ~1200 bars = full session).
+Retry:
+  A simple fixed-delay retry loop guards against transient yfinance failures.
 """
 
 import logging
-from datetime import date, datetime, timedelta  # timedelta used in _third_wednesday
+import time
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import pytz
-from fugle_marketdata import RestClient
+import yfinance as yf
 
 logger = logging.getLogger("tx_observer.fetcher")
 
-TW_TZ = pytz.timezone("Asia/Taipei")
+TW_TZ   = pytz.timezone("Asia/Taipei")
+_SYMBOL = "WTX=F"
+
+_MAX_RETRIES: int = 3
+_RETRY_DELAY: int = 5   # seconds between retries
 
 
 # ===========================================================================
 # Public class
 # ===========================================================================
 
-class FugleDataFetcher:
+class YFinanceDataFetcher:
     """
-    Fetches TX Futures 1-minute OHLCV bars from the Fugle Market Data API.
+    Fetches TX Futures 1-minute OHLCV bars from Yahoo Finance (WTX=F).
 
     Usage
     -----
-    fetcher = FugleDataFetcher(api_key="YOUR_TOKEN")
+    fetcher = YFinanceDataFetcher()
     df_1min = fetcher.fetch_1min_bars(periods=1200)
-    df_5k   = FugleDataFetcher.resample_to_timeframe(df_1min, "5min")
-    df_60k  = FugleDataFetcher.resample_to_timeframe(df_1min, "60min")
+    df_5k   = YFinanceDataFetcher.resample_to_timeframe(df_1min, "5min")
+    df_60k  = YFinanceDataFetcher.resample_to_timeframe(df_1min, "60min")
     """
 
-    def __init__(self, api_key: str) -> None:
-        if not api_key:
-            raise ValueError("FUGLE_API_TOKEN is empty.")
-        self._client = RestClient(api_key=api_key)
+    def __init__(self) -> None:
         self._latest_close: float | None = None
 
     # ------------------------------------------------------------------
@@ -54,15 +55,16 @@ class FugleDataFetcher:
 
     def fetch_1min_bars(self, periods: int = 1200) -> pd.DataFrame:
         """
-        Fetch the latest *periods* 1-minute bars for the TX near-month contract.
+        Fetch the latest *periods* 1-minute bars for WTX=F.
 
-        Uses the intraday endpoint (current session only); the number of
-        available bars depends on how much of the session has elapsed.
+        Downloads the last 5 calendar days of 1-minute data (the maximum
+        yfinance allows for 1m interval is 7 days) and returns the most
+        recent *periods* bars.
 
         Parameters
         ----------
         periods : int
-            Maximum number of 1-minute bars to return (most recent).
+            Maximum number of bars to return (most recent).
 
         Returns
         -------
@@ -72,41 +74,18 @@ class FugleDataFetcher:
         Raises
         ------
         RuntimeError
-            If the API returns no data or an unexpected response.
+            If all retry attempts fail or the response is empty.
         """
-        now    = datetime.now(tz=TW_TZ)
-        symbol = _get_near_month_symbol(now)
+        raw = self._download_with_retry(interval="1m", period="5d")
+        df  = self._normalise(raw)
 
-        logger.info("Fetching intraday 1-min bars: symbol=%s", symbol)
-
-        try:
-            response = self._client.futopt.intraday.candles(
-                symbol=symbol,
-                timeframe="1",
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Fugle API request failed: {exc}") from exc
-
-        candles = response.get("candles") or response.get("data") or []
-        if not candles:
-            raise RuntimeError(
-                f"Fugle API returned no candle data for {symbol} "
-                f"({date_from} → {date_to}). Market may be closed."
-            )
-
-        df = _parse_candles(candles)
-
-        if len(df) == 0:
-            raise RuntimeError(f"No parseable bars returned for {symbol}.")
-
-        # Trim to the most recent `periods` bars
         if len(df) > periods:
             df = df.iloc[-periods:].reset_index(drop=True)
 
         self._latest_close = float(df["Close"].iloc[-1])
         logger.info(
-            "FugleDataFetcher: %d 1-min bars fetched for %s | latest close = %.0f",
-            len(df), symbol, self._latest_close,
+            "YFinanceDataFetcher: %d 1-min bars fetched for %s | latest close = %.0f",
+            len(df), _SYMBOL, self._latest_close,
         )
         return df
 
@@ -185,73 +164,96 @@ class FugleDataFetcher:
         """Fetch and return 60-minute K-line data."""
         return self.resample_to_timeframe(self.fetch_1min_bars(periods_1min), "60min")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _download_with_retry(self, interval: str, period: str) -> pd.DataFrame:
+        """
+        Call yf.download() with up to _MAX_RETRIES attempts.
+
+        Raises RuntimeError if every attempt fails or returns empty data.
+        """
+        last_exc: Exception | None = None
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                df = yf.download(
+                    _SYMBOL,
+                    interval=interval,
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
+                if df.empty:
+                    raise ValueError(
+                        f"yfinance returned an empty DataFrame for {_SYMBOL} "
+                        f"(interval={interval}, period={period}). "
+                        "Market may be closed or symbol unavailable."
+                    )
+                return df
+
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    logger.warning(
+                        "yfinance download attempt %d/%d failed: %s — retrying in %ds...",
+                        attempt, _MAX_RETRIES, exc, _RETRY_DELAY,
+                    )
+                    time.sleep(_RETRY_DELAY)
+
+        raise RuntimeError(
+            f"yfinance download failed after {_MAX_RETRIES} attempts: {last_exc}"
+        ) from last_exc
+
+    @staticmethod
+    def _normalise(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalise a raw yfinance DataFrame into the standard OHLCV format.
+
+        Handles:
+        - Multi-level columns produced by newer yfinance versions
+        - Timezone conversion to Asia/Taipei
+        - Column renaming to Title-Case (Open/High/Low/Close/Volume)
+        - Reset index so 'Datetime' becomes a regular column
+        """
+        # ── Multi-level columns (yfinance >= 0.2 with single ticker) ──────
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # ── Normalise column names to Title-Case ──────────────────────────
+        df.columns = [c.title() for c in df.columns]
+
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        missing  = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"yfinance response missing columns: {missing}")
+
+        df = df[required].copy()
+
+        # ── Timezone → Asia/Taipei ────────────────────────────────────────
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert(TW_TZ)
+
+        # ── Drop NaN rows (e.g. outside-session padding) ─────────────────
+        df = df.dropna(subset=["Close"])
+        df = df.sort_index()
+
+        # ── Promote index to regular 'Datetime' column ────────────────────
+        df.index.name = "Datetime"
+        df = df.reset_index()
+
+        return df
+
 
 # ===========================================================================
-# Internal helpers
+# Near-month symbol helpers (kept for reference / future use)
 # ===========================================================================
-
-def _get_near_month_symbol(dt: datetime) -> str:
-    """
-    Return the near-month TX Futures symbol for a given datetime.
-
-    TX futures expire on the third Wednesday of each month.
-    After settlement, the contract rolls to the next month.
-
-    Examples
-    --------
-    2026-03-16 (before 3rd Wed Mar 18) → TXFC6
-    2026-03-20 (after  3rd Wed Mar 18) → TXFD6
-    """
-    year  = dt.year
-    month = dt.month
-
-    expiry = _third_wednesday(year, month)
-    if dt.date() >= expiry:
-        if month == 12:
-            month, year = 1, year + 1
-        else:
-            month += 1
-
-    month_code = chr(ord("A") + month - 1)   # A=Jan … L=Dec
-    year_code  = str(year % 10)
-    return f"TXF{month_code}{year_code}"
-
 
 def _third_wednesday(year: int, month: int) -> date:
     """Return the date of the third Wednesday of the given month."""
     d = date(year, month, 1)
-    # Weekday: Mon=0 … Sun=6; Wednesday=2
     days_to_first_wed = (2 - d.weekday()) % 7
     return d + timedelta(days=days_to_first_wed + 14)
-
-
-def _parse_candles(candles: list[dict]) -> pd.DataFrame:
-    """
-    Parse a Fugle candles list into a standardised OHLCV DataFrame.
-
-    Handles both tz-aware and tz-naive date strings; normalises all
-    timestamps to Asia/Taipei.
-    """
-    rows = []
-    for c in candles:
-        try:
-            dt = pd.to_datetime(c["date"])
-            if dt.tzinfo is None:
-                dt = dt.tz_localize(TW_TZ)
-            else:
-                dt = dt.tz_convert(TW_TZ)
-            rows.append({
-                "Datetime": dt,
-                "Open":     float(c["open"]),
-                "High":     float(c["high"]),
-                "Low":      float(c["low"]),
-                "Close":    float(c["close"]),
-                "Volume":   int(c.get("volume", 0)),
-            })
-        except (KeyError, ValueError) as exc:
-            logger.warning("Skipping malformed candle record: %s | error: %s", c, exc)
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("Datetime").reset_index(drop=True)
-    return df
