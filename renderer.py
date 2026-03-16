@@ -54,7 +54,7 @@ _DARK_STYLE = mpf.make_mpf_style(
         "xtick.color":      "#8b949e",
         "ytick.color":      "#8b949e",
         "figure.titlesize": 11,
-        "figure.titlecolor": "#e6edf3",
+        "text.color":       "#e6edf3",
     },
 )
 
