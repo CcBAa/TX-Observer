@@ -1,10 +1,25 @@
 """
 fetcher.py — Data fetching and resampling for TX-Observer.
 
-Currently ships a MockDataFetcher that simulates realistic TX Futures
-(台指期近月) 1-minute OHLCV bars using geometric Brownian motion.
-Replace MockDataFetcher with a real broker API implementation when ready;
-the resample_to_timeframe() interface remains the same.
+MockDataFetcher simulates realistic TX Futures (台指期近月) 1-minute OHLCV
+bars using a Markov regime-switching model with GARCH(1,1)-like volatility
+clustering, producing charts that resemble real market structure:
+
+  • Three regimes — uptrend / downtrend / sideways — driven by a Markov chain
+    with high persistence (~100-bar average duration), so trends and ranges
+    are visually obvious across a session.
+  • GARCH(1,1)-style volatility clustering: elevated vol persists after large
+    moves, creating the bursts and quiet patches seen in real futures charts.
+  • Round-number gravity: mild mean-reversion toward every 100-pt level
+    (e.g. 20 000, 20 100) simulates psychological support/resistance.
+  • Realistic intrabar high/low: wick size scales with volatility; trending
+    bars have smaller counter-trend wicks than reversal/doji-like bars.
+  • Volume correlated with price-move magnitude and intraday U-curve
+    (surge at open and close of each session).
+
+Replace MockDataFetcher with a real Shioaji (永豐金) broker API when ready;
+the public interface — fetch_1min_bars() and resample_to_timeframe() —
+remains unchanged.
 """
 
 import logging
@@ -19,25 +34,64 @@ logger = logging.getLogger("tx_observer.fetcher")
 TW_TZ = pytz.timezone("Asia/Taipei")
 
 # ---------------------------------------------------------------------------
-# Constants — TX Futures characteristics
+# Market constants
 # ---------------------------------------------------------------------------
-_BASE_PRICE: float = 20_000.0          # Approximate index level
-_DAILY_VOLATILITY: float = 0.015       # ~1.5 % daily standard deviation
-_TICK_SIZE: float = 1.0                # Minimum price move = 1 point
-_TRADING_MINUTES_PER_DAY: int = 840    # Combined day + night session (~14 h)
-_MIN_VOL: int = 300                    # Minimum contracts per 1-min bar
-_MAX_VOL: int = 3_000                  # Maximum contracts per 1-min bar
+_BASE_PRICE: float = 20_000.0
+_TICK_SIZE:  float = 1.0
+_MIN_VOL:    int   = 300
+_MAX_VOL:    int   = 3_000
 
+# Per-minute volatility derived from ~1.5 % daily vol over 840 trading minutes
+_DAILY_VOL:    float = 0.015
+_TRADING_MINS: int   = 840
+_BASE_MIN_VOL: float = _DAILY_VOL / np.sqrt(_TRADING_MINS)   # ≈ 0.000518
+
+# ---------------------------------------------------------------------------
+# Markov regime-switching
+# ---------------------------------------------------------------------------
+# States:  0 = uptrend,  1 = downtrend,  2 = sideways
+_UPTREND, _DOWNTREND, _SIDEWAYS = 0, 1, 2
+
+# High persistence keeps each regime visible for ~100 bars on average
+# (1 / (1 - diagonal element))
+_TRANSITION = np.array([
+    [0.990, 0.003, 0.007],   # uptrend
+    [0.003, 0.990, 0.007],   # downtrend
+    [0.005, 0.005, 0.990],   # sideways
+])
+
+# Per-minute drift (fractional log-return) for each regime
+_REGIME_DRIFT = np.array([+0.00010, -0.00010, 0.0])
+
+# Volatility multiplier applied on top of the GARCH baseline
+_REGIME_VOL_MULT = np.array([1.4, 1.4, 0.55])
+
+# ---------------------------------------------------------------------------
+# GARCH(1,1) parameters  (omega + alpha + beta < 1 → stationary)
+# ---------------------------------------------------------------------------
+_GARCH_OMEGA: float = _BASE_MIN_VOL ** 2 * 0.05   # baseline variance
+_GARCH_ALPHA: float = 0.10                          # shock impact
+_GARCH_BETA:  float = 0.85                          # variance persistence
+
+# ---------------------------------------------------------------------------
+# Round-number gravity
+# ---------------------------------------------------------------------------
+_ROUND_LEVEL: float = 100.0    # key psychological levels every 100 pts
+_GRAVITY:     float = 0.04     # pull toward nearest level per bar (fractional)
+
+
+# ===========================================================================
+# Public class
+# ===========================================================================
 
 class MockDataFetcher:
     """
-    Simulates TX Futures 1-minute OHLCV bars using geometric Brownian motion
-    with intraday volume weighting and open/close surge effects.
+    Simulates TX Futures 1-minute OHLCV bars with realistic market structure.
 
     Usage
     -----
     fetcher = MockDataFetcher()
-    df_1min = fetcher.fetch_1min_bars(periods=480)
+    df_1min = fetcher.fetch_1min_bars(periods=1200)
     df_5k   = MockDataFetcher.resample_to_timeframe(df_1min, "5min")
     df_60k  = MockDataFetcher.resample_to_timeframe(df_1min, "60min")
     """
@@ -56,8 +110,8 @@ class MockDataFetcher:
 
         Parameters
         ----------
-        periods:
-            Number of 1-minute bars to generate (default 480 = 8 hours).
+        periods : int
+            Number of 1-minute bars (default 480 = 8 hours).
 
         Returns
         -------
@@ -70,43 +124,21 @@ class MockDataFetcher:
         now_tw = datetime.now(tz=TW_TZ).replace(second=0, microsecond=0)
         timestamps = [now_tw - timedelta(minutes=i) for i in range(periods - 1, -1, -1)]
 
-        # Per-minute volatility derived from daily vol
-        min_vol = _DAILY_VOLATILITY / np.sqrt(_TRADING_MINUTES_PER_DAY)
+        # ── Step 1: Markov regime sequence ────────────────────────────────
+        regimes = _generate_regimes(periods)
 
-        # Random drift (simulates intraday trending / mean-reversion regime)
-        drift = np.random.choice([-1.0, 0.0, 1.0]) * min_vol * 0.25
+        # ── Step 2: GARCH(1,1) volatility series ─────────────────────────
+        vol_series = _generate_garch_vol(periods, _REGIME_VOL_MULT[regimes])
 
-        # Log-returns with slight autocorrelation (momentum)
-        raw_returns = np.random.normal(drift, min_vol, periods)
-        returns = _apply_momentum(raw_returns, alpha=0.15)
+        # ── Step 3: Close price series ────────────────────────────────────
+        closes = _generate_closes(self.base_price, periods, regimes, vol_series)
 
-        # Build close price series
-        closes = np.empty(periods)
-        closes[0] = self.base_price * np.exp(np.random.normal(0, min_vol * 2))
-        for i in range(1, periods):
-            raw = closes[i - 1] * np.exp(returns[i])
-            closes[i] = round(raw / _TICK_SIZE) * _TICK_SIZE
+        # ── Step 4: Intrabar OHLC ─────────────────────────────────────────
+        opens, highs, lows = _build_ohlc(closes, vol_series, regimes)
 
-        # Intra-bar high/low spread (proportional to bar vol)
-        spread_vol = min_vol * 0.6
-        half_spread = np.abs(np.random.normal(0, spread_vol, periods)) * closes
-
-        highs = np.round((closes + half_spread) / _TICK_SIZE) * _TICK_SIZE
-        lows  = np.round((closes - half_spread) / _TICK_SIZE) * _TICK_SIZE
-
-        # Opens = previous close with small gap
-        opens = np.empty(periods)
-        opens[0] = closes[0] * np.exp(np.random.normal(0, spread_vol))
-        opens[0] = round(opens[0] / _TICK_SIZE) * _TICK_SIZE
-        opens[1:] = np.roll(closes, 1)[1:]
-
-        # Ensure OHLC consistency: High >= max(O, C), Low <= min(O, C)
-        for i in range(periods):
-            highs[i] = round(max(highs[i], opens[i], closes[i]) / _TICK_SIZE) * _TICK_SIZE
-            lows[i]  = round(min(lows[i],  opens[i], closes[i]) / _TICK_SIZE) * _TICK_SIZE
-
-        # Volume: U-shaped curve (surge at open and close)
-        volumes = _generate_volume_curve(periods, _MIN_VOL, _MAX_VOL)
+        # ── Step 5: Volume ────────────────────────────────────────────────
+        log_returns = np.abs(np.diff(np.log(np.maximum(closes, 1e-6))))
+        volumes = _generate_volume(periods, log_returns, regimes)
 
         df = pd.DataFrame(
             {
@@ -145,11 +177,10 @@ class MockDataFetcher:
 
         Parameters
         ----------
-        df_1min:
+        df_1min : pd.DataFrame
             1-minute DataFrame with a 'Datetime' column or DatetimeIndex.
-        timeframe:
-            Pandas offset alias, e.g. ``"5min"`` (5-minute) or
-            ``"60min"`` / ``"1h"`` (60-minute).
+        timeframe : str
+            Pandas offset alias, e.g. ``"5min"`` or ``"60min"``.
 
         Returns
         -------
@@ -180,9 +211,10 @@ class MockDataFetcher:
             .rename(columns={"index": "Datetime"})
         )
 
-        # Ensure the Datetime column is named correctly after reset_index
         if df_resampled.columns[0] != "Datetime":
-            df_resampled = df_resampled.rename(columns={df_resampled.columns[0]: "Datetime"})
+            df_resampled = df_resampled.rename(
+                columns={df_resampled.columns[0]: "Datetime"}
+            )
 
         logger.info(
             "Resampled to %s: %d bars (from %d 1-min bars)",
@@ -196,44 +228,176 @@ class MockDataFetcher:
     # Convenience wrappers
     # ------------------------------------------------------------------
 
-    def fetch_5k(self, periods_1min: int = 300) -> pd.DataFrame:
+    def fetch_5k(self, periods_1min: int = 1200) -> pd.DataFrame:
         """Fetch and return 5-minute K-line data."""
         df = self.fetch_1min_bars(periods=periods_1min)
         return self.resample_to_timeframe(df, "5min")
 
-    def fetch_60k(self, periods_1min: int = 1_440) -> pd.DataFrame:
+    def fetch_60k(self, periods_1min: int = 1200) -> pd.DataFrame:
         """Fetch and return 60-minute K-line data."""
         df = self.fetch_1min_bars(periods=periods_1min)
         return self.resample_to_timeframe(df, "60min")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Internal helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def _apply_momentum(returns: np.ndarray, alpha: float = 0.15) -> np.ndarray:
-    """Apply simple AR(1)-style momentum smoothing to a return series."""
-    smoothed = np.empty_like(returns)
-    smoothed[0] = returns[0]
-    for i in range(1, len(returns)):
-        smoothed[i] = alpha * smoothed[i - 1] + (1 - alpha) * returns[i]
-    return smoothed
-
-
-def _generate_volume_curve(periods: int, vol_min: int, vol_max: int) -> np.ndarray:
+def _generate_regimes(periods: int) -> np.ndarray:
     """
-    Generate a U-shaped intraday volume curve.
-    The first and last 10 % of bars receive ~2× average volume.
+    Sample a Markov chain regime sequence of length *periods*.
+
+    Returns an int array with values 0 (uptrend), 1 (downtrend), 2 (sideways).
+    Initial state is drawn from the stationary distribution.
     """
-    base = np.random.randint(vol_min, vol_max, periods).astype(float)
-    surge = max(1, int(periods * 0.10))
+    # Stationary distribution via eigen-decomposition fallback
+    init_probs = np.array([0.30, 0.30, 0.40])
+    regimes = np.empty(periods, dtype=int)
+    regimes[0] = np.random.choice(_TRANSITION.shape[0], p=init_probs)
+    for i in range(1, periods):
+        regimes[i] = np.random.choice(
+            _TRANSITION.shape[0], p=_TRANSITION[regimes[i - 1]]
+        )
+    return regimes
 
-    # Opening surge
-    open_mult = np.linspace(2.0, 1.0, surge)
-    base[:surge] *= open_mult
 
-    # Closing surge
-    close_mult = np.linspace(1.0, 2.0, surge)
-    base[-surge:] *= close_mult
+def _generate_garch_vol(periods: int, regime_vol_mult: np.ndarray) -> np.ndarray:
+    """
+    Generate a GARCH(1,1)-style conditional volatility series.
 
-    return base.astype(int)
+    The unconditional variance is anchored to *_BASE_MIN_VOL*; regime
+    multipliers scale it up (trending) or down (sideways).
+
+    Returns
+    -------
+    np.ndarray
+        Per-bar standard deviation (same unit as log-returns).
+    """
+    vol = np.empty(periods)
+    h = _BASE_MIN_VOL ** 2      # initial conditional variance
+    eps = 0.0                   # previous shock
+
+    for i in range(periods):
+        # Regime-scaled unconditional variance acts as a time-varying omega
+        target_var = (_BASE_MIN_VOL * regime_vol_mult[i]) ** 2
+        omega_i    = target_var * (1 - _GARCH_ALPHA - _GARCH_BETA)
+        h = omega_i + _GARCH_ALPHA * eps ** 2 + _GARCH_BETA * h
+        h = max(h, 1e-12)       # numerical floor
+        sigma = np.sqrt(h)
+        vol[i] = sigma
+        eps = np.random.normal(0, sigma)
+
+    return vol
+
+
+def _generate_closes(
+    base_price: float,
+    periods: int,
+    regimes: np.ndarray,
+    vol_series: np.ndarray,
+) -> np.ndarray:
+    """
+    Build a close-price series using regime drift, GARCH vol, and
+    round-number gravity.
+    """
+    closes = np.empty(periods)
+    # Randomise starting price slightly around the base
+    closes[0] = round(
+        base_price * np.exp(np.random.normal(0, _BASE_MIN_VOL * 3)) / _TICK_SIZE
+    ) * _TICK_SIZE
+
+    for i in range(1, periods):
+        drift  = _REGIME_DRIFT[regimes[i]]
+        shock  = np.random.normal(0, vol_series[i])
+
+        # Round-number gravity: fractional pull toward nearest _ROUND_LEVEL
+        nearest = round(closes[i - 1] / _ROUND_LEVEL) * _ROUND_LEVEL
+        gravity = _GRAVITY * (nearest - closes[i - 1]) / closes[i - 1]
+
+        log_ret = drift + shock + gravity
+        raw     = closes[i - 1] * np.exp(log_ret)
+        closes[i] = round(raw / _TICK_SIZE) * _TICK_SIZE
+
+    return closes
+
+
+def _build_ohlc(
+    closes: np.ndarray,
+    vol_series: np.ndarray,
+    regimes: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Derive Open, High, Low arrays from the Close series.
+
+    Wick behaviour:
+    - Trending bars (uptrend/downtrend): smaller counter-trend wick,
+      larger wick in the direction of the move.
+    - Sideways bars: symmetric wicks (doji/spinning-top shape).
+    """
+    periods = len(closes)
+    opens   = np.empty(periods)
+    highs   = np.empty(periods)
+    lows    = np.empty(periods)
+
+    # Open = previous close (no gap for intraday; slight gap at bar 0)
+    opens[0] = round(
+        closes[0] * np.exp(np.random.normal(0, vol_series[0] * 0.5)) / _TICK_SIZE
+    ) * _TICK_SIZE
+    opens[1:] = closes[:-1]
+
+    for i in range(periods):
+        body_top    = max(opens[i], closes[i])
+        body_bottom = min(opens[i], closes[i])
+        sigma       = vol_series[i] * closes[i]   # in price points
+
+        if regimes[i] == _UPTREND:
+            upper_wick = abs(np.random.normal(0, sigma * 0.8))
+            lower_wick = abs(np.random.normal(0, sigma * 0.3))
+        elif regimes[i] == _DOWNTREND:
+            upper_wick = abs(np.random.normal(0, sigma * 0.3))
+            lower_wick = abs(np.random.normal(0, sigma * 0.8))
+        else:  # sideways — symmetric wicks
+            upper_wick = abs(np.random.normal(0, sigma * 0.6))
+            lower_wick = abs(np.random.normal(0, sigma * 0.6))
+
+        highs[i] = round((body_top    + upper_wick) / _TICK_SIZE) * _TICK_SIZE
+        lows[i]  = round((body_bottom - lower_wick) / _TICK_SIZE) * _TICK_SIZE
+
+        # Guarantee OHLC consistency
+        highs[i] = max(highs[i], body_top)
+        lows[i]  = min(lows[i],  body_bottom)
+
+    return opens, highs, lows
+
+
+def _generate_volume(
+    periods: int,
+    log_returns: np.ndarray,
+    regimes: np.ndarray,
+) -> np.ndarray:
+    """
+    Generate volume correlated with price-move magnitude and intraday curve.
+
+    Larger absolute returns → higher volume (confirms moves).
+    Trending regimes → slightly higher average volume than sideways.
+    """
+    # Base random volume
+    base = np.random.randint(_MIN_VOL, _MAX_VOL, periods).astype(float)
+
+    # Scale by absolute return magnitude (normalised) — first bar has no return
+    if len(log_returns) > 0:
+        max_ret = log_returns.max() if log_returns.max() > 0 else 1.0
+        ret_scale = np.ones(periods)
+        ret_scale[1:] = 1.0 + 2.5 * (log_returns / max_ret)
+        base *= ret_scale
+
+    # Regime volume boost: trends draw more participation
+    regime_boost = np.where(regimes == _SIDEWAYS, 0.7, 1.2)
+    base *= regime_boost
+
+    # Intraday U-curve (surge at open and close)
+    surge_bars = max(1, int(periods * 0.10))
+    base[:surge_bars]  *= np.linspace(2.2, 1.0, surge_bars)
+    base[-surge_bars:] *= np.linspace(1.0, 2.2, surge_bars)
+
+    return np.clip(base, _MIN_VOL, _MAX_VOL * 3).astype(int)
