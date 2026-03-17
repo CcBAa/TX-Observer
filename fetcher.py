@@ -1,91 +1,179 @@
 """
 fetcher.py — Data fetching and resampling for TX-Observer.
 
-Fetches TX Futures (台指期) 1-minute OHLCV bars from Yahoo Finance
-using the symbol WTX=F (near-month contract).
+Uses Shioaji (永豐金 API) to fetch 2330 (TSMC) spot stock 1-minute
+OHLCV bars while TX Futures permissions are pending.
 
-Limitations:
-  yfinance 1m interval supports a maximum 7-day lookback window.
-  Available bar count depends on how many sessions fall within that window.
-  MA lines requiring more bars (e.g. MA240 on 5K) will appear gradually.
+Public interface is kept identical to the original YFinanceDataFetcher so
+main.py needs zero changes (YFinanceDataFetcher is aliased to ShioajiDataFetcher).
 
-Retry:
-  A simple fixed-delay retry loop guards against transient yfinance failures.
+A module-level Shioaji API singleton is created on first use and logged out
+automatically via atexit when the process exits.
 """
 
+import atexit
 import logging
-import time
-from datetime import date, datetime, timedelta
+import os
+from datetime import date, timedelta
 
 import pandas as pd
 import pytz
-import yfinance as yf
+import shioaji as sj
+from dotenv import load_dotenv
+
+# Safety net: load .env even when fetcher is imported before config.py
+load_dotenv()
 
 logger = logging.getLogger("tx_observer.fetcher")
 
-TW_TZ   = pytz.timezone("Asia/Taipei")
-_SYMBOL = "WTX=F"
+TW_TZ     = pytz.timezone("Asia/Taipei")
+_SYMBOL   = "2330"
+_EXCHANGE = "TSE"
 
-_MAX_RETRIES: int = 3
-_RETRY_DELAY: int = 5   # seconds between retries
+
+# ===========================================================================
+# Shioaji API singleton
+# ===========================================================================
+
+_api: "sj.Shioaji | None" = None
+
+
+def _get_api() -> "sj.Shioaji":
+    """Return the module-level Shioaji API instance, creating it on first call."""
+    global _api
+    if _api is None:
+        _api = _create_and_login()
+    return _api
+
+
+def _create_and_login() -> "sj.Shioaji":
+    api_key    = os.getenv("SHIOAJI_API_KEY", "").strip()
+    secret_key = os.getenv("SHIOAJI_SECRET_KEY", "").strip()
+
+    if not api_key or not secret_key:
+        raise EnvironmentError(
+            "SHIOAJI_API_KEY and/or SHIOAJI_SECRET_KEY are missing from .env"
+        )
+
+    api = sj.Shioaji()
+    try:
+        api.login(api_key=api_key, secret_key=secret_key)
+        logger.info("Shioaji login successful.")
+    except Exception as exc:
+        logger.error("Shioaji login failed: %s", exc)
+        raise RuntimeError(f"Shioaji login failed: {exc}") from exc
+
+    # Ensure logout runs even on unhandled exceptions / KeyboardInterrupt
+    atexit.register(_logout, api)
+    return api
+
+
+def _logout(api: "sj.Shioaji") -> None:
+    try:
+        api.logout()
+        logger.info("Shioaji logout completed.")
+    except Exception as exc:
+        logger.warning("Shioaji logout warning: %s", exc)
 
 
 # ===========================================================================
 # Public class
 # ===========================================================================
 
-class YFinanceDataFetcher:
+class ShioajiDataFetcher:
     """
-    Fetches TX Futures 1-minute OHLCV bars from Yahoo Finance (WTX=F).
+    Fetches 2330 (TSMC) 1-minute OHLCV bars from Shioaji.
 
     Usage
     -----
-    fetcher = YFinanceDataFetcher()
+    fetcher = ShioajiDataFetcher()
     df_1min = fetcher.fetch_1min_bars(periods=1200)
-    df_5k   = YFinanceDataFetcher.resample_to_timeframe(df_1min, "5min")
-    df_60k  = YFinanceDataFetcher.resample_to_timeframe(df_1min, "60min")
+    df_5k   = ShioajiDataFetcher.resample_to_timeframe(df_1min, "5min")
+    df_60k  = ShioajiDataFetcher.resample_to_timeframe(df_1min, "60min")
+
+    To switch back to TX Futures (WTX=F via yfinance), replace the alias at
+    the bottom of this file:
+        YFinanceDataFetcher = <original YFinanceDataFetcher class>
     """
 
-    def __init__(self) -> None:
-        self._latest_close: float | None = None
+    def __init__(self, symbol: str = _SYMBOL) -> None:
+        self._symbol       = symbol
+        self._latest_close: "float | None" = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def fetch_1min_bars(self, periods: int = 1200) -> pd.DataFrame:
+    def fetch_1min_bars(
+        self,
+        periods: int = 1200,
+        start:   "str | None" = None,
+        end:     "str | None" = None,
+    ) -> pd.DataFrame:
         """
-        Fetch the latest *periods* 1-minute bars for WTX=F.
-
-        Downloads the last 5 calendar days of 1-minute data (the maximum
-        yfinance allows for 1m interval is 7 days) and returns the most
-        recent *periods* bars.
+        Fetch the latest *periods* 1-minute bars for the configured stock.
 
         Parameters
         ----------
         periods : int
             Maximum number of bars to return (most recent).
+            Ignored when both *start* and *end* are supplied explicitly.
+        start : str, optional
+            Date string "yyyy-mm-dd". Defaults to 10 calendar days ago.
+        end : str, optional
+            Date string "yyyy-mm-dd". Defaults to today.
 
         Returns
         -------
         pd.DataFrame
-            Columns: Datetime (tz-aware UTC+8), Open, High, Low, Close, Volume
+            Columns: Datetime (tz-aware Asia/Taipei), Open, High, Low, Close, Volume
 
         Raises
         ------
         RuntimeError
-            If all retry attempts fail or the response is empty.
+            If Shioaji login or kbars call fails.
+        ValueError
+            If the response contains no rows.
         """
-        raw = self._download_with_retry(interval="1m", period="5d")
-        df  = self._normalise(raw)
+        today = date.today()
+        if end is None:
+            end = today.strftime("%Y-%m-%d")
+        if start is None:
+            # 10 calendar days back ensures we capture enough trading sessions
+            start = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+
+        api      = _get_api()
+        contract = api.Contracts.Stocks[_EXCHANGE][self._symbol]
+
+        logger.info(
+            "Fetching 1-min kbars: %s  %s → %s", self._symbol, start, end
+        )
+
+        try:
+            kbars = api.kbars(contract, start=start, end=end)
+        except Exception as exc:
+            logger.error("api.kbars() raised an exception: %s", exc)
+            raise RuntimeError(f"Shioaji kbars fetch failed: {exc}") from exc
+
+        df = self._normalise(kbars)
+
+        if df.empty:
+            logger.error(
+                "api.kbars() returned no data for %s (%s → %s). "
+                "Market may be closed or the symbol is unavailable.",
+                self._symbol, start, end,
+            )
+            raise ValueError(
+                f"No kbar data returned for {self._symbol} ({start} → {end})"
+            )
 
         if len(df) > periods:
             df = df.iloc[-periods:].reset_index(drop=True)
 
         self._latest_close = float(df["Close"].iloc[-1])
         logger.info(
-            "YFinanceDataFetcher: %d 1-min bars fetched for %s | latest close = %.0f",
-            len(df), _SYMBOL, self._latest_close,
+            "ShioajiDataFetcher: %d 1-min bars | %s | latest close = %.2f",
+            len(df), self._symbol, self._latest_close,
         )
         return df
 
@@ -141,6 +229,7 @@ class YFinanceDataFetcher:
             .rename(columns={"index": "Datetime"})
         )
 
+        # Ensure the time column is always named 'Datetime'
         if df_resampled.columns[0] != "Datetime":
             df_resampled = df_resampled.rename(
                 columns={df_resampled.columns[0]: "Datetime"}
@@ -168,80 +257,57 @@ class YFinanceDataFetcher:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _download_with_retry(self, interval: str, period: str) -> pd.DataFrame:
-        """
-        Call yf.download() with up to _MAX_RETRIES attempts.
-
-        Raises RuntimeError if every attempt fails or returns empty data.
-        """
-        last_exc: Exception | None = None
-
-        for attempt in range(1, _MAX_RETRIES + 1):
-            try:
-                df = yf.download(
-                    _SYMBOL,
-                    interval=interval,
-                    period=period,
-                    auto_adjust=True,
-                    progress=False,
-                    threads=False,
-                )
-                if df.empty:
-                    raise ValueError(
-                        f"yfinance returned an empty DataFrame for {_SYMBOL} "
-                        f"(interval={interval}, period={period}). "
-                        "Market may be closed or symbol unavailable."
-                    )
-                return df
-
-            except Exception as exc:
-                last_exc = exc
-                if attempt < _MAX_RETRIES:
-                    logger.warning(
-                        "yfinance download attempt %d/%d failed: %s — retrying in %ds...",
-                        attempt, _MAX_RETRIES, exc, _RETRY_DELAY,
-                    )
-                    time.sleep(_RETRY_DELAY)
-
-        raise RuntimeError(
-            f"yfinance download failed after {_MAX_RETRIES} attempts: {last_exc}"
-        ) from last_exc
-
     @staticmethod
-    def _normalise(df: pd.DataFrame) -> pd.DataFrame:
+    def _normalise(kbars) -> pd.DataFrame:
         """
-        Normalise a raw yfinance DataFrame into the standard OHLCV format.
+        Convert a Shioaji Kbars object to a clean OHLCV DataFrame.
 
-        Handles:
-        - Multi-level columns produced by newer yfinance versions
-        - Timezone conversion to Asia/Taipei
-        - Column renaming to Title-Case (Open/High/Low/Close/Volume)
-        - Reset index so 'Datetime' becomes a regular column
+        Steps
+        -----
+        1. pd.DataFrame({**kbars})    — unpack Shioaji's named-tuple-like object
+        2. Normalise column names     — lowercase then rename to Title-Case
+        3. ts → DatetimeIndex         — nanosecond Unix epoch → Asia/Taipei
+        4. Drop NaN rows, sort asc    — remove any padding outside session
+        5. Promote index → 'Datetime' column  — consistent with resample output
         """
-        # ── Multi-level columns (yfinance >= 0.2 with single ticker) ──────
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = pd.DataFrame({**kbars})
 
-        # ── Normalise column names to Title-Case ──────────────────────────
-        df.columns = [c.title() for c in df.columns]
+        if df.empty:
+            return df
+
+        # ── Step 2: normalise all column names to lowercase first ─────────
+        df.columns = [c.lower() for c in df.columns]
+
+        rename_map = {
+            "open":   "Open",
+            "high":   "High",
+            "low":    "Low",
+            "close":  "Close",
+            "volume": "Volume",
+        }
+        df = df.rename(columns=rename_map)
 
         required = ["Open", "High", "Low", "Close", "Volume"]
         missing  = [c for c in required if c not in df.columns]
         if missing:
-            raise ValueError(f"yfinance response missing columns: {missing}")
+            raise ValueError(f"Shioaji kbars response is missing columns: {missing}")
 
-        df = df[required].copy()
+        # ── Step 3: ts → tz-aware Asia/Taipei DatetimeIndex ──────────────
+        # Shioaji returns ts as integer nanoseconds since Unix epoch.
+        # Guard against the case where it is already a datetime.
+        ts_col = df["ts"]
+        if pd.api.types.is_integer_dtype(ts_col):
+            dt_index = pd.to_datetime(ts_col, unit="ns", utc=True).dt.tz_convert(
+                "Asia/Taipei"
+            )
+        else:
+            dt_index = pd.to_datetime(ts_col, utc=True).dt.tz_convert("Asia/Taipei")
 
-        # ── Timezone → Asia/Taipei ────────────────────────────────────────
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        df.index = df.index.tz_convert(TW_TZ)
+        df["Datetime"] = dt_index
+        df = df.set_index("Datetime")[required].copy()
 
-        # ── Drop NaN rows (e.g. outside-session padding) ─────────────────
-        df = df.dropna(subset=["Close"])
-        df = df.sort_index()
-
-        # ── Promote index to regular 'Datetime' column ────────────────────
+        # ── Steps 4 & 5 ───────────────────────────────────────────────────
+        df = df.dropna(subset=["Close"]).sort_index()
         df.index.name = "Datetime"
         df = df.reset_index()
 
@@ -249,11 +315,44 @@ class YFinanceDataFetcher:
 
 
 # ===========================================================================
-# Near-month symbol helpers (kept for reference / future use)
+# Backwards-compatible alias
+# Lets main.py keep `from fetcher import YFinanceDataFetcher` unchanged.
 # ===========================================================================
 
-def _third_wednesday(year: int, month: int) -> date:
-    """Return the date of the third Wednesday of the given month."""
-    d = date(year, month, 1)
-    days_to_first_wed = (2 - d.weekday()) % 7
-    return d + timedelta(days=days_to_first_wed + 14)
+YFinanceDataFetcher = ShioajiDataFetcher
+
+
+# ===========================================================================
+# Standalone convenience function
+# ===========================================================================
+
+def fetch_data(
+    symbol:    str = _SYMBOL,
+    timeframe: str = "1min",
+    periods:   int = 1200,
+    start:     "str | None" = None,
+    end:       "str | None" = None,
+) -> pd.DataFrame:
+    """
+    Top-level convenience function — easy to call and easy to swap back
+    to a different data source.
+
+    Parameters
+    ----------
+    symbol    : str   Stock/futures symbol, e.g. "2330".
+    timeframe : str   "1min", "5min", "15min", "30min", or "60min".
+    periods   : int   Max number of 1-min bars to fetch before resampling.
+    start     : str   Date string "yyyy-mm-dd" (optional).
+    end       : str   Date string "yyyy-mm-dd" (optional).
+
+    Returns
+    -------
+    pd.DataFrame
+        OHLCV DataFrame at the requested timeframe.
+    """
+    fetcher = ShioajiDataFetcher(symbol=symbol)
+    df_1min = fetcher.fetch_1min_bars(periods=periods, start=start, end=end)
+
+    if timeframe == "1min":
+        return df_1min
+    return ShioajiDataFetcher.resample_to_timeframe(df_1min, timeframe)
