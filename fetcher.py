@@ -16,13 +16,15 @@ import logging
 import os
 from datetime import date, timedelta
 
+from pathlib import Path
+
 import pandas as pd
 import pytz
 import shioaji as sj
 from dotenv import load_dotenv
 
-# Safety net: load .env even when fetcher is imported before config.py
-load_dotenv()
+# Use the same .env path resolution as config.py (absolute, not CWD-relative)
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 logger = logging.getLogger("tx_observer.fetcher")
 
