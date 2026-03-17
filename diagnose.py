@@ -53,17 +53,25 @@ print(df_raw[["ts", "dt", "Open", "High", "Low", "Close", "Volume"]].head().to_s
 
 # ── 3. 每天的第一根與最後一根 ─────────────────────────────────────────────────
 print("\n" + "=" * 60)
-print("【每日第一根 & 最後一根 bar】")
+print("【每日第一根 & 最後一根 bar（含 Volume=0 的幽靈 bar）】")
 df_raw["date"] = df_raw["dt"].dt.date
 for d, grp in df_raw.groupby("date"):
     first = grp.iloc[0]
     last  = grp.iloc[-1]
     print(
         f"  {d}  "
-        f"第一根: {first['dt'].strftime('%H:%M:%S')}  O={first['Open']}  "
-        f"→  最後一根: {last['dt'].strftime('%H:%M:%S')}  C={last['Close']}  "
-        f"共 {len(grp)} 根"
+        f"第一根: {first['dt'].strftime('%H:%M:%S')}  O={first['Open']}  V={int(first['Volume'])}  "
+        f"→  最後一根: {last['dt'].strftime('%H:%M:%S')}  C={last['Close']}  V={int(last['Volume'])}  "
+        f"共 {len(grp)} 根（其中 V=0: {int((grp['Volume']==0).sum())} 根）"
     )
+
+# ── 3b. 最近一個交易日前 5 根 → 確認 ts 是 bar 的開始還是結束 ───────────────────
+print("\n" + "=" * 60)
+print("【最近交易日前 5 根原始 bar — 用來判斷 ts 是 bar 開始還是結束】")
+print("  判斷方式：若第 1 根時間為 09:00 → ts = bar 開始；若為 09:01 → ts = bar 結束")
+latest_day = df_raw["date"].max()
+day_bars   = df_raw[df_raw["date"] == latest_day].sort_values("dt")
+print(day_bars[["dt", "Open", "High", "Low", "Close", "Volume"]].head(5).to_string())
 
 # ── 4. 非交易時間 bar（09:00 前 或 13:30 後）────────────────────────────────
 print("\n" + "=" * 60)
