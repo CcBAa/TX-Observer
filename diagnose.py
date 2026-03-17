@@ -46,7 +46,7 @@ print(f"ts 最小值    : {df_raw['ts'].min()}")
 print(f"ts 最大值    : {df_raw['ts'].max()}")
 
 # ── 2. 轉換成台灣時間 ─────────────────────────────────────────────────────────
-df_raw["dt"] = pd.to_datetime(df_raw["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
+df_raw["dt"] = pd.to_datetime(df_raw["ts"], unit="ns").dt.tz_localize("Asia/Taipei")
 
 print("\n【轉換後 datetime（前 5 筆）】")
 print(df_raw[["ts", "dt", "Open", "High", "Low", "Close", "Volume"]].head().to_string())

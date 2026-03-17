@@ -302,15 +302,15 @@ class ShioajiDataFetcher:
             raise ValueError(f"Shioaji kbars response is missing columns: {missing}")
 
         # ── Step 3: ts → tz-aware Asia/Taipei DatetimeIndex ──────────────
-        # Shioaji returns ts as integer nanoseconds since Unix epoch.
-        # Guard against the case where it is already a datetime.
+        # Shioaji stores ts as nanoseconds where the epoch base is CST
+        # (UTC+8) wall-clock time, NOT UTC. Treating it as UTC and then
+        # converting would add an extra +8 h shift. The correct approach is
+        # to parse as a naive datetime and then tz_localize to Asia/Taipei.
         ts_col = df["ts"]
         if pd.api.types.is_integer_dtype(ts_col):
-            dt_index = pd.to_datetime(ts_col, unit="ns", utc=True).dt.tz_convert(
-                "Asia/Taipei"
-            )
+            dt_index = pd.to_datetime(ts_col, unit="ns").dt.tz_localize("Asia/Taipei")
         else:
-            dt_index = pd.to_datetime(ts_col, utc=True).dt.tz_convert("Asia/Taipei")
+            dt_index = pd.to_datetime(ts_col).dt.tz_localize("Asia/Taipei")
 
         df["Datetime"] = dt_index
         df = df.set_index("Datetime")[required].copy()
