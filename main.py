@@ -45,7 +45,7 @@ from config import get_credentials, setup_logging
 logger = setup_logging()
 
 # Project modules (imported after logging is configured)
-from fetcher import YFinanceDataFetcher                      # noqa: E402
+from fetcher import ShioajiDataFetcher                       # noqa: E402
 from notifier import send_push_message, upload_to_imgbb     # noqa: E402
 from renderer import render_chart                           # noqa: E402
 
@@ -55,9 +55,12 @@ from renderer import render_chart                           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-# 1200 one-minute bars = 20 hours of data
-# → gives ~20 usable 60K bars and ~240 usable 5K bars (sufficient for MA240 on 5K)
-_FETCH_PERIODS_1MIN = 1200
+# 2330 trades 09:00–13:30 = 270 min/day.
+# MA240 on 60K requires 240 × 60 = 14,400 1-min bars (≈ 53 trading days).
+# 15,000 adds a small buffer on top.
+_FETCH_PERIODS_1MIN = 15_000
+_DATA_SYMBOL        = "2330"   # TSMC spot (proxy while TX Futures perms pending)
+_DATA_LABEL         = "2330 台積電 (spot)"
 
 
 # ---------------------------------------------------------------------------
@@ -154,14 +157,14 @@ def run_job() -> None:
 
     try:
         # ── Fetch ──────────────────────────────────────────────────────────
-        logger.info("Fetching %d 1-minute bars via yfinance (%s)...", _FETCH_PERIODS_1MIN, "WTX=F")
-        fetcher = YFinanceDataFetcher()
+        logger.info("Fetching %d 1-min bars via Shioaji (%s)...", _FETCH_PERIODS_1MIN, _DATA_SYMBOL)
+        fetcher = ShioajiDataFetcher(symbol=_DATA_SYMBOL)
         df_1min = fetcher.fetch_1min_bars(periods=_FETCH_PERIODS_1MIN)
 
         # ── Resample ───────────────────────────────────────────────────────
         logger.info("Resampling → 5min and 60min...")
-        df_5k  = YFinanceDataFetcher.resample_to_timeframe(df_1min, "5min")
-        df_60k = YFinanceDataFetcher.resample_to_timeframe(df_1min, "60min")
+        df_5k  = ShioajiDataFetcher.resample_to_timeframe(df_1min, "5min")
+        df_60k = ShioajiDataFetcher.resample_to_timeframe(df_1min, "60min")
 
         # ── Price summary ──────────────────────────────────────────────────
         latest_close = float(df_1min["Close"].iloc[-1])
@@ -188,9 +191,9 @@ def run_job() -> None:
         # ── Compose push text ──────────────────────────────────────────────
         push_text = (
             f"[TX-Observer]  {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
-            f"TX Futures — Near Month\n"
-            f"Last:    {latest_close:>10,.0f}\n"
-            f"Change:  {arrow} {abs(change):,.0f}  ({change_pct:+.2f}%)\n"
+            f"{_DATA_LABEL}\n"
+            f"Last:    {latest_close:>10,.2f}\n"
+            f"Change:  {arrow} {abs(change):.2f}  ({change_pct:+.2f}%)\n"
             f"Charts:  60K + 5K"
         )
 

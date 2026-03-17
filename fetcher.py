@@ -13,6 +13,7 @@ automatically via atexit when the process exits.
 
 import atexit
 import logging
+import math
 import os
 from datetime import date, timedelta
 
@@ -121,7 +122,7 @@ class ShioajiDataFetcher:
             Maximum number of bars to return (most recent).
             Ignored when both *start* and *end* are supplied explicitly.
         start : str, optional
-            Date string "yyyy-mm-dd". Defaults to 10 calendar days ago.
+            Date string "yyyy-mm-dd". Defaults to a window derived from *periods*.
         end : str, optional
             Date string "yyyy-mm-dd". Defaults to today.
 
@@ -141,8 +142,14 @@ class ShioajiDataFetcher:
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            # 10 calendar days back ensures we capture enough trading sessions
-            start = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+            # Derive the lookback window from the requested bar count so that
+            # MA240 on 60K (needs 14,400 1-min bars ≈ 53 trading days) always
+            # has enough history.
+            # 2330 trades 270 min/day; scale to calendar days (×7/5) + 15-day
+            # buffer for public holidays.
+            trading_days  = math.ceil(periods / 270)
+            calendar_days = math.ceil(trading_days * 7 / 5) + 15
+            start = (today - timedelta(days=calendar_days)).strftime("%Y-%m-%d")
 
         api      = _get_api()
         contract = api.Contracts.Stocks[_EXCHANGE][self._symbol]
