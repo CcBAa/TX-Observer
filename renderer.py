@@ -41,7 +41,8 @@ _MARKET_COLORS = mpf.make_marketcolors(
 _DARK_STYLE = mpf.make_mpf_style(
     base_mpf_style="nightclouds",
     marketcolors=_MARKET_COLORS,
-    mavcolors=["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#C0C0C0"],   # MA5=gold, MA10=dodger blue, MA20=hot pink, MA60=orange, MA240=silver
+    # mavcolors intentionally omitted — MAs are drawn via addplot (pre-computed
+    # from full history) rather than the mav= parameter.
     gridstyle="--",
     gridcolor="#2a2a3e",
     facecolor="#0d1117",        # Axes background
@@ -57,6 +58,24 @@ _DARK_STYLE = mpf.make_mpf_style(
         "text.color":       "#e6edf3",
     },
 )
+
+# ---------------------------------------------------------------------------
+# MA configuration
+# MA lines are pre-computed on the FULL dataset so values at the display
+# window tail are correct, then sliced together with the OHLCV data.
+# ---------------------------------------------------------------------------
+_MA_PERIODS = [5,        10,       20,       60,       240     ]
+_MA_COLORS  = ["#FFD700","#00BFFF","#FF69B4","#FFA500","#C0C0C0"]
+_MA_WIDTHS  = [1.0,      1.0,      1.0,      1.2,      1.2     ]
+
+# How many candles to actually render per timeframe.
+# The full dataset is still used for MA calculation above.
+_DISPLAY_BARS: dict[str, int] = {
+    "1K":  200,
+    "5K":  150,
+    "60K": 100,
+}
+_DISPLAY_BARS_DEFAULT = 150
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -121,7 +140,15 @@ def render_chart(
         )
 
     # ------------------------------------------------------------------
-    # Build title
+    # Pre-compute MAs on the FULL dataset
+    # This is the critical step: rolling() sees all history, so the MA
+    # values at the tail of the display window are correct even after slicing.
+    # ------------------------------------------------------------------
+    for period in _MA_PERIODS:
+        df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
+
+    # ------------------------------------------------------------------
+    # Build title (use last close from full dataset, before slicing)
     # ------------------------------------------------------------------
     latest_close = float(df_plot["Close"].iloc[-1])
     prev_close   = float(df_plot["Close"].iloc[-2]) if len(df_plot) > 1 else latest_close
@@ -130,7 +157,7 @@ def render_chart(
     change_arrow = "▲" if change >= 0 else "▼"
 
     title_line1 = (
-        f"TX-Observer  |  {timeframe}  |  "
+        f"TXF (台指期近一)  |  {timeframe}  |  "
         f"Last: {latest_close:,.0f}  "
         f"{change_arrow} {abs(change):.0f} ({change_pct:+.2f}%)"
     )
@@ -141,20 +168,41 @@ def render_chart(
     title = f"{title_line1}\n{title_line2}"
 
     # ------------------------------------------------------------------
+    # Slice to display window
+    # ------------------------------------------------------------------
+    display_bars = _DISPLAY_BARS.get(timeframe.upper(), _DISPLAY_BARS_DEFAULT)
+    df_display   = df_plot.iloc[-display_bars:].copy()
+    logger.info(
+        "Rendering %s: displaying last %d of %d bars",
+        timeframe, len(df_display), len(df_plot),
+    )
+
+    # ------------------------------------------------------------------
+    # Build addplot list from pre-computed (and now sliced) MA columns
+    # ------------------------------------------------------------------
+    addplots = _build_ma_addplots(df_display)
+
+    # Strip MA columns — mpf.plot() only wants OHLCV
+    ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
+    df_display = df_display[ohlcv_cols]
+
+    # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
+    plot_kwargs: dict = dict(
+        type="candle",
+        style=_DARK_STYLE,
+        title=title,
+        volume=True,
+        figsize=(18, 10),
+        savefig={"fname": str(filepath), "dpi": 150, "bbox_inches": "tight"},
+        warn_too_much_data=10_000,
+    )
+    if addplots:
+        plot_kwargs["addplot"] = addplots
+
     try:
-        mpf.plot(
-            df_plot,
-            type="candle",
-            style=_DARK_STYLE,
-            title=title,
-            mav=(5, 10, 20, 60, 240),
-            volume=True,
-            figsize=(18, 10),
-            savefig={"fname": str(filepath), "dpi": 150, "bbox_inches": "tight"},
-            warn_too_much_data=2_000,
-        )
+        mpf.plot(df_display, **plot_kwargs)
         plt.close("all")  # Release memory after saving
         logger.info("Chart saved → %s", filepath)
         return filepath
@@ -168,6 +216,30 @@ def render_chart(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _build_ma_addplots(df: pd.DataFrame) -> list:
+    """
+    Build a list of mplfinance addplot objects for the pre-computed MA columns
+    in *df*.  Columns that are entirely NaN (not enough history for that period)
+    are silently skipped.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Display-window slice that already contains MA{n} columns alongside OHLCV.
+    """
+    result = []
+    for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
+        col = f"MA{period}"
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if series.notna().any():
+            result.append(
+                mpf.make_addplot(series, color=color, width=width, secondary_y=False)
+            )
+    return result
+
 
 def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
