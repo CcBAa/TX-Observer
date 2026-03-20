@@ -28,14 +28,9 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 # Style — Taiwan market convention: red = up, green = down
 # ---------------------------------------------------------------------------
 _MARKET_COLORS = mpf.make_marketcolors(
-    up="#EF5350",       # Bullish candle body  (red)
-    down="#26A69A",     # Bearish candle body  (green / teal)
-    edge="inherit",
-    wick="inherit",
-    volume={
-        "up":   "#EF535088",   # Semi-transparent red for up-volume bars
-        "down": "#26A69A88",   # Semi-transparent teal for down-volume bars
-    },
+    up="red",           # Bullish candle — Taiwan convention (紅漲)
+    down="green",       # Bearish candle — Taiwan convention (綠跌)
+    inherit=True,       # Edge, wick, and volume bars all inherit up/down colours
 )
 
 _DARK_STYLE = mpf.make_mpf_style(
@@ -72,10 +67,10 @@ _MA_WIDTHS  = [1.0,      1.0,      1.0,      1.2,      1.2     ]
 # The full dataset is still used for MA calculation above.
 _DISPLAY_BARS: dict[str, int] = {
     "1K":  200,
-    "5K":  150,
-    "60K": 100,
+    "5K":  120,   # ~1 full trading day of 5-min bars — matches XQ default view
+    "60K":  80,   # ~4 trading weeks of hourly bars
 }
-_DISPLAY_BARS_DEFAULT = 150
+_DISPLAY_BARS_DEFAULT = 120
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -197,6 +192,7 @@ def render_chart(
         figsize=(18, 10),
         savefig={"fname": str(filepath), "dpi": 150, "bbox_inches": "tight"},
         warn_too_much_data=10_000,
+        show_nontrading=False,   # suppress weekend/holiday blank columns
     )
     if addplots:
         plot_kwargs["addplot"] = addplots

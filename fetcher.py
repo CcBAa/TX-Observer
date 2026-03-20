@@ -229,13 +229,18 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
 
     # ── Build resample kwargs ──────────────────────────────────────────────
     # closed='right' + label='right': the right boundary is the bin label.
-    # offset only needed for 60-min to shift bins from :00 to :45.
+    #
+    # offset='45min' aligns bins to TXF's 08:45 open:
+    #   5-min  : 45 % 5 == 0, so default bins already hit :45.
+    #            Adding offset='45min' is mathematically identical to the
+    #            default but makes the intent explicit.
+    #   60-min : default bins land at :00 (08:00, 09:00 …).
+    #            offset='45min' shifts them to :45 (08:45, 09:45 …) ← required.
     rs_kwargs: dict = {"closed": "right", "label": "right"}
-    if timeframe == "60min":
-        if _PD_GTE_1_1:
-            rs_kwargs["offset"] = "45min"   # pandas >= 1.1 (deprecated base=)
-        else:
-            rs_kwargs["base"] = 45          # pandas < 1.1
+    if _PD_GTE_1_1:
+        rs_kwargs["offset"] = "45min"       # pandas >= 1.1
+    else:
+        rs_kwargs["base"] = 45              # pandas < 1.1 (base in minutes)
 
     # ── Step 2: resample each block independently ──────────────────────────
     blocks: list[pd.DataFrame] = []
