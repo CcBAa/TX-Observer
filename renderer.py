@@ -1,13 +1,25 @@
 """
 renderer.py — Headless K-line chart rendering for TX-Observer.
 
-Uses mplfinance with a custom dark theme that follows Taiwan market colour
-conventions (red candle = price up, green candle = price down).
+Public API
+----------
+render_combined_chart(df_5k, df_60k, symbol, output_dir) → Path
+    Renders 5K and 60K charts into a single combined PNG image:
+      - Upper panel (60% height): 5K candlestick + MA lines
+      - Lower panel (40% height): 60K candlestick + MA lines
 
-The Agg backend is forced so this module works on headless Linux servers
-with no display or GUI libraries.
+Design notes
+------------
+- Forces Agg backend (no GUI / display required)
+- Taiwan colour convention: red = up (漲), green = down (跌)
+- MA lines pre-computed on the FULL dataset so tail values are accurate
+  after slicing to the display window
+- Two panels are rendered independently by mplfinance (returnfig=True)
+  then stitched vertically with Pillow — this avoids mplfinance external-axes
+  compatibility quirks and produces identical styling for both panels
 """
 
+import io
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -15,33 +27,32 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")  # Must be set BEFORE any other matplotlib import
 
-import matplotlib.pyplot as plt  # noqa: E402  (imported after backend override)
+import matplotlib.pyplot as plt  # noqa: E402
 import mplfinance as mpf          # noqa: E402
 import pandas as pd               # noqa: E402
 import pytz                       # noqa: E402
+from PIL import Image             # noqa: E402  (Pillow — stitch panels)
 
 logger = logging.getLogger("tx_observer.renderer")
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 
 # ---------------------------------------------------------------------------
-# Style — Taiwan market convention: red = up, green = down
+# Market style — Taiwan convention: red = up (漲), green = down (跌)
 # ---------------------------------------------------------------------------
 _MARKET_COLORS = mpf.make_marketcolors(
-    up="red",           # Bullish candle — Taiwan convention (紅漲)
-    down="green",       # Bearish candle — Taiwan convention (綠跌)
-    inherit=True,       # Edge, wick, and volume bars all inherit up/down colours
+    up="red",
+    down="green",
+    inherit=True,
 )
 
 _DARK_STYLE = mpf.make_mpf_style(
     base_mpf_style="nightclouds",
     marketcolors=_MARKET_COLORS,
-    # mavcolors intentionally omitted — MAs are drawn via addplot (pre-computed
-    # from full history) rather than the mav= parameter.
     gridstyle="--",
     gridcolor="#2a2a3e",
-    facecolor="#0d1117",        # Axes background
-    figcolor="#0d1117",         # Figure background
+    facecolor="#0d1117",
+    figcolor="#0d1117",
     y_on_right=True,
     rc={
         "font.size":        9,
@@ -49,32 +60,23 @@ _DARK_STYLE = mpf.make_mpf_style(
         "axes.edgecolor":   "#30363d",
         "xtick.color":      "#8b949e",
         "ytick.color":      "#8b949e",
-        "figure.titlesize": 11,
+        "figure.titlesize": 10,
         "text.color":       "#e6edf3",
     },
 )
 
 # ---------------------------------------------------------------------------
-# MA configuration
-# MA lines are pre-computed on the FULL dataset so values at the display
-# window tail are correct, then sliced together with the OHLCV data.
+# MA configuration — periods 5, 10, 20, 60 (Taiwan standard)
 # ---------------------------------------------------------------------------
-_MA_PERIODS = [5,        10,       20,       60,       240     ]
-_MA_COLORS  = ["#FFD700","#00BFFF","#FF69B4","#FFA500","#C0C0C0"]
-_MA_WIDTHS  = [1.0,      1.0,      1.0,      1.2,      1.2     ]
+_MA_PERIODS = [5,         10,       20,       60      ]
+_MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500"]
+_MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2     ]
 
-# How many candles to actually render per timeframe.
-# The full dataset is still used for MA calculation above.
-_DISPLAY_BARS: dict[str, int] = {
-    "1K":  200,
-    "5K":  120,   # ~1 full trading day of 5-min bars — matches XQ default view
-    "60K":  80,   # ~4 trading weeks of hourly bars
-}
-_DISPLAY_BARS_DEFAULT = 120
+# Display window sizes
+_5K_DISPLAY_BARS  = 120   # ~1 full trading day of 5-min bars
+_60K_DISPLAY_BARS = 80    # ~4 trading weeks of hourly bars
 
-# ---------------------------------------------------------------------------
 # Output directory
-# ---------------------------------------------------------------------------
 DEFAULT_OUTPUT_DIR = Path("charts")
 
 
@@ -82,121 +84,150 @@ DEFAULT_OUTPUT_DIR = Path("charts")
 # Public API
 # ---------------------------------------------------------------------------
 
-def render_chart(
-    df: pd.DataFrame,
-    timeframe: str,
-    output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+def render_combined_chart(
+    df_5k:      pd.DataFrame,
+    df_60k:     pd.DataFrame,
+    symbol:     str,
+    output_dir: "Path | str" = DEFAULT_OUTPUT_DIR,
 ) -> Path:
     """
-    Render a candlestick chart with MA lines (5, 10, 20) and volume subplot.
+    Render 5K and 60K panels into a single combined PNG.
+
+    Layout
+    ------
+    Upper panel (60% of total height): 5K candles + volume + MA(5,10,20,60)
+    Lower panel (40% of total height): 60K candles + volume + MA(5,10,20,60)
 
     Parameters
     ----------
-    df:
-        OHLCV DataFrame.  Must contain columns Open, High, Low, Close, Volume
-        and either a 'Datetime' column or a DatetimeIndex.
-    timeframe:
-        Label used in the filename and chart title, e.g. ``"5K"`` or ``"60K"``.
-    output_dir:
-        Directory where the PNG file will be saved.  Created automatically.
+    df_5k      : OHLCV DataFrame at 5-min resolution (from fetcher).
+    df_60k     : OHLCV DataFrame at 60-min resolution (from fetcher).
+    symbol     : Display name shown in chart titles, e.g. "台指期近一".
+    output_dir : Directory for the output PNG. Created if absent.
 
     Returns
     -------
-    Path
-        Absolute path to the saved PNG file.
-
-    Raises
-    ------
-    ValueError
-        If the DataFrame has fewer than 3 rows (not enough to draw a chart).
-    RuntimeError
-        If mplfinance raises an unexpected error during rendering.
+    Path to the saved PNG file.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    now_tw = datetime.now(tz=TW_TZ)
-    timestamp_str = now_tw.strftime("%Y%m%d_%H%M")
-    filename = f"tx_{timeframe.lower()}_{timestamp_str}.png"
+    now_tw   = datetime.now(tz=TW_TZ)
+    safe_sym = symbol.replace("/", "-").replace(" ", "_")
+    filename = f"{safe_sym}_5k60k_{now_tw.strftime('%Y%m%d_%H%M')}.png"
     filepath = (output_dir / filename).resolve()
 
-    df_plot = _prepare_dataframe(df)
+    logger.info("Rendering combined chart [%s] 5K+60K...", symbol)
 
-    # Drop any rows with missing OHLCV values before MA computation so that
-    # rolling() produces correct averages rather than propagating NaNs.
+    # Render each panel to an in-memory PNG buffer
+    # figsize heights: 5K = 60% of 14", 60K = 40% of 14"
+    buf_5k  = _render_panel_to_buffer(
+        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 8.4), now=now_tw
+    )
+    buf_60k = _render_panel_to_buffer(
+        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 5.6), now=now_tw
+    )
+
+    # Stitch vertically
+    img_5k  = Image.open(buf_5k)
+    img_60k = Image.open(buf_60k)
+
+    # Ensure both panels have the same width
+    if img_5k.width != img_60k.width:
+        img_60k = img_60k.resize(
+            (img_5k.width, img_60k.height), Image.LANCZOS
+        )
+
+    combined = Image.new("RGB", (img_5k.width, img_5k.height + img_60k.height),
+                         color=(13, 17, 23))
+    combined.paste(img_5k,  (0, 0))
+    combined.paste(img_60k, (0, img_5k.height))
+    combined.save(str(filepath))
+
+    for obj in (buf_5k, buf_60k, img_5k, img_60k, combined):
+        obj.close()
+
+    logger.info("Combined chart saved → %s", filepath)
+    return filepath
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _render_panel_to_buffer(
+    df:           pd.DataFrame,
+    symbol:       str,
+    timeframe:    str,
+    display_bars: int,
+    figsize:      "tuple[float, float]",
+    now:          datetime,
+) -> io.BytesIO:
+    """
+    Render a single candlestick panel to a BytesIO PNG buffer.
+
+    MAs are computed on the FULL dataset for accuracy, then the view
+    is sliced to *display_bars* before plotting.
+    """
+    df_plot = _prepare_dataframe(df)
     df_plot = df_plot.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
     if len(df_plot) < 3:
         raise ValueError(
-            f"DataFrame has only {len(df_plot)} row(s); at least 3 are required to render a chart."
+            f"[{symbol}] {timeframe}: only {len(df_plot)} bar(s) available "
+            f"(need at least 3)."
         )
 
-    # Warn if not enough bars for MA240
-    if len(df_plot) < 240:
-        logger.warning(
-            "Only %d bars available — MA240 will be incomplete (need >= 240).",
-            len(df_plot),
-        )
-
-    # ------------------------------------------------------------------
-    # Pre-compute MAs on the FULL dataset
-    # This is the critical step: rolling() sees all history, so the MA
-    # values at the tail of the display window are correct even after slicing.
-    # ------------------------------------------------------------------
+    # Compute MAs on the full dataset BEFORE slicing
     for period in _MA_PERIODS:
         df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
 
-    # ------------------------------------------------------------------
-    # Build title (use last close from full dataset, before slicing)
-    # ------------------------------------------------------------------
-    latest_close = float(df_plot["Close"].iloc[-1])
-    prev_close   = float(df_plot["Close"].iloc[-2]) if len(df_plot) > 1 else latest_close
-    change       = latest_close - prev_close
-    change_pct   = (change / prev_close) * 100.0 if prev_close else 0.0
-    change_arrow = "▲" if change >= 0 else "▼"
+    # Price summary from the most recent bar (full dataset)
+    latest = float(df_plot["Close"].iloc[-1])
+    prev   = float(df_plot["Close"].iloc[-2]) if len(df_plot) > 1 else latest
+    chg    = latest - prev
+    pct    = (chg / prev * 100.0) if prev else 0.0
+    arrow  = "▲" if chg >= 0 else "▼"
 
-    title_line1 = (
-        f"TXF (台指期近一)  |  {timeframe}  |  "
-        f"Last: {latest_close:,.0f}  "
-        f"{change_arrow} {abs(change):.0f} ({change_pct:+.2f}%)"
-    )
-    title_line2 = (
-        f"Generated: {now_tw.strftime('%Y-%m-%d %H:%M')} (UTC+8)  "
-        f"|  MA: 5 (gold)  10 (blue)  20 (pink)  60 (orange)  240 (silver)"
-    )
-    title = f"{title_line1}\n{title_line2}"
-
-    # ------------------------------------------------------------------
     # Slice to display window
-    # ------------------------------------------------------------------
-    display_bars = _DISPLAY_BARS.get(timeframe.upper(), _DISPLAY_BARS_DEFAULT)
-    df_display   = df_plot.iloc[-display_bars:].copy()
+    df_display = df_plot.iloc[-display_bars:].copy()
+
     logger.info(
-        "Rendering %s: displaying last %d of %d bars",
-        timeframe, len(df_display), len(df_plot),
+        "Rendering [%s] %s: displaying last %d of %d bars",
+        symbol, timeframe, len(df_display), len(df_plot),
     )
 
-    # ------------------------------------------------------------------
-    # Build addplot list from pre-computed (and now sliced) MA columns
-    # ------------------------------------------------------------------
+    # Build MA addplots from the sliced display DataFrame
     addplots = _build_ma_addplots(df_display)
 
-    # Strip MA columns — mpf.plot() only wants OHLCV
+    # Strip MA columns — mpf.plot() expects pure OHLCV
     ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
     df_display = df_display[ohlcv_cols]
 
-    # ------------------------------------------------------------------
-    # Render
-    # ------------------------------------------------------------------
+    # Build title
+    if timeframe == "5K":
+        title = (
+            f"[{symbol}]  5K  ·  Last: {latest:,.0f}  "
+            f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
+            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙)  "
+            f"·  {now.strftime('%Y-%m-%d %H:%M')} UTC+8"
+        )
+    else:
+        title = (
+            f"[{symbol}]  60K  ·  Last: {latest:,.0f}  "
+            f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
+            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙)"
+        )
+
     plot_kwargs: dict = dict(
         type="candle",
         style=_DARK_STYLE,
         title=title,
         volume=True,
-        figsize=(18, 10),
-        returnfig=True,          # We save manually so we can post-process doji colour
+        figsize=figsize,
+        returnfig=True,
         warn_too_much_data=10_000,
-        show_nontrading=False,   # suppress weekend/holiday blank columns
+        show_nontrading=False,
     )
     if addplots:
         plot_kwargs["addplot"] = addplots
@@ -204,31 +235,28 @@ def render_chart(
     try:
         fig, axes = mpf.plot(df_display, **plot_kwargs)
         _color_doji_candles(axes[0], df_display)
-        fig.savefig(str(filepath), dpi=150, bbox_inches="tight")
-        plt.close("all")  # Release memory after saving
-        logger.info("Chart saved → %s", filepath)
-        return filepath
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
 
     except Exception as exc:
         plt.close("all")
-        logger.error("Failed to render %s chart: %s", timeframe, exc, exc_info=True)
-        raise RuntimeError(f"Chart rendering failed for {timeframe}") from exc
+        logger.error(
+            "Failed to render [%s] %s panel: %s", symbol, timeframe, exc,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            f"Chart rendering failed for [{symbol}] {timeframe}"
+        ) from exc
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _build_ma_addplots(df: pd.DataFrame) -> list:
     """
-    Build a list of mplfinance addplot objects for the pre-computed MA columns
-    in *df*.  Columns that are entirely NaN (not enough history for that period)
-    are silently skipped.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Display-window slice that already contains MA{n} columns alongside OHLCV.
+    Build mplfinance addplot objects for the pre-computed MA columns in *df*.
+    Columns that are entirely NaN (insufficient history) are silently skipped.
     """
     result = []
     for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
@@ -244,19 +272,7 @@ def _build_ma_addplots(df: pd.DataFrame) -> list:
 
 
 def _color_doji_candles(ax, df: pd.DataFrame, color: str = "#FFD700") -> None:
-    """
-    Recolour candle bodies where Open == Close (doji) to *color* (default gold).
-
-    mplfinance renders each candle body as a ``matplotlib.patches.Rectangle``
-    in the price axis, in the same order as the DataFrame rows.  We iterate
-    over those patches and repaint any whose corresponding bar is a doji.
-
-    Parameters
-    ----------
-    ax    : the primary (price) Axes returned by ``mpf.plot(..., returnfig=True)``
-    df    : the OHLCV DataFrame that was passed to ``mpf.plot()``
-    color : any matplotlib colour string / hex; defaults to gold (#FFD700)
-    """
+    """Recolour doji candle bodies (Open == Close) to *color* (gold)."""
     patches = ax.patches
     if not patches:
         return
@@ -273,8 +289,6 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     Normalise the input DataFrame for mplfinance:
       - Ensures a proper DatetimeIndex
       - Converts tz-aware index to Asia/Taipei then strips tz-info
-        (mplfinance can handle tz-aware indexes, but stripping avoids
-        occasional formatting quirks with some mplfinance versions)
     """
     df = df.copy()
 
@@ -284,14 +298,11 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
 
-    # Normalise timezone: convert to UTC+8, then make tz-naive for plotting
     if df.index.tz is not None:
         df.index = df.index.tz_convert(TW_TZ).tz_localize(None)
 
-    # mplfinance requires the index to be sorted ascending
     df = df.sort_index()
 
-    # Keep only the four OHLCV columns (drop any extras)
     required_cols = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:

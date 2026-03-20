@@ -4,8 +4,8 @@
 # Environment / configuration
 python-dotenv>=1.0.0
 
-# Market data — Yahoo Finance (台指期 WTX=F)
-yfinance>=0.2.40
+# Market data — 永豐金 Shioaji API
+shioaji>=1.1.0
 
 # Data handling
 pandas>=2.0.0
@@ -14,6 +14,7 @@ numpy>=1.24.0
 # Chart rendering (headless — no GUI required)
 mplfinance>=0.12.10b0
 matplotlib>=3.7.3
+Pillow>=10.0.0          # PIL — stitch dual-panel combined charts
 
 # HTTP client — Imgbb upload + LINE Messaging API push
 requests>=2.28.0

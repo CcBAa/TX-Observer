@@ -1,21 +1,21 @@
 """
 fetcher.py — Data fetching and resampling for TX-Observer.
 
-Uses Shioaji (永豐金 API) to fetch 台指期貨近一連續合約 (TXFR1) 1-minute
-OHLCV bars, then resamples to the requested timeframe using session-aware
-aggregation.
+Supports three symbols:
+  - TXFR1   : 台指期貨近一連續合約 (futures, day + night session)
+  - TSE/001 : 加權指數 (spot, 09:00–13:30)
+  - OTC/101 : 櫃買指數 (spot, 09:00–13:30)
 
-Why session-aware resample?
-    pandas resample() treats time as a continuous axis.  Without isolation,
-    a 60-min bin can straddle the 13:45–15:00 gap and produce a phantom bar
-    that mixes the afternoon close with the night-session open — causing the
-    discrepancy visible between TX-Observer and XQ.
+All symbols share the same Shioaji API singleton — login happens once at
+process startup via init_api() / _get_api().
 
-Public interface
-----------------
-fetcher = ShioajiDataFetcher()
-df_5k  = fetcher.fetch_bars("5min",  bars=200)
-df_60k = fetcher.fetch_bars("60min", bars=100)
+Resample convention
+-------------------
+TXFR1 5K  : session-isolated resample with offset='45min' (XQ-standard bins)
+TXFR1 60K : custom groupby using _get_60k_label() — different cut-points for
+             day (cut at :46) and night (cut at :01) sessions
+Spot  5K  : session-isolated resample, standard bins (no offset)
+Spot  60K : custom groupby using _get_60k_label_spot() — cut at :01 / 13:30
 """
 
 import atexit
@@ -31,7 +31,6 @@ import shioaji as sj
 from dotenv import load_dotenv
 
 # pandas >= 1.1 replaced resample(base=) with resample(offset=)
-# pandas >= 2.2 removed base= entirely
 _PD_GTE_1_1 = tuple(int(x) for x in pd.__version__.split(".")[:2]) >= (1, 1)
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -42,34 +41,38 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 
 
 # ---------------------------------------------------------------------------
-# TXF session windows (UTC+8 wall-clock times)
+# TXF futures session windows (UTC+8)
 # ---------------------------------------------------------------------------
-# Day session   : 08:45 – 13:45
-# Night session : 15:00 – 05:00 (next day)
-# Closed        : 05:01 – 08:44  and  13:46 – 14:59
 _DAY_START   = dtime(8, 45)
 _DAY_END     = dtime(13, 45)
 _NIGHT_START = dtime(15, 0)
 _NIGHT_END   = dtime(5, 0)
 
-# Gap threshold for session-block detection.
-# Any time-delta > this value between adjacent 1-min bars marks a new block.
+# Spot index session window (TSE / OTC, UTC+8)
+_SPOT_DAY_START = dtime(9, 0)
+_SPOT_DAY_END   = dtime(13, 30)
+
+# Gap threshold for session-block detection
 _SESSION_GAP = pd.Timedelta(minutes=70)
 
 # Conservative estimate: TXF 1-min bars per trading day
-# Day 300 min + night tail ~180 min average = 480
 _TRADING_MIN_PER_DAY = 480
 
+# Spot symbols → (Shioaji market group, contract code)
+_SPOT_SYMBOLS: dict[str, tuple[str, str]] = {
+    "TSE/001": ("TSE", "TSE001"),
+    "OTC/101": ("OTC", "OTC101"),
+}
+
+
+# ===========================================================================
+# Session classification helpers
+# ===========================================================================
 
 def _get_trading_session(t: dtime) -> "str | None":
     """
-    Classify a UTC+8 wall-clock time into a TXF trading session.
-
-    Returns
-    -------
-    'day'   — 08:45–13:45  (regular session)
-    'night' — 15:00–05:00  (after-hours, wraps midnight)
-    None    — 05:01–08:44 or 13:46–14:59 (closed periods; bar should be dropped)
+    TXF trading session classifier.
+    Returns 'day' (08:45–13:45), 'night' (15:00–05:00), or None (closed).
     """
     if _DAY_START <= t <= _DAY_END:
         return "day"
@@ -80,63 +83,74 @@ def _get_trading_session(t: dtime) -> "str | None":
     return None
 
 
+def _get_spot_trading_session(t: dtime) -> "str | None":
+    """TSE/OTC spot index session: 09:00–13:30 only."""
+    if _SPOT_DAY_START <= t <= _SPOT_DAY_END:
+        return "day"
+    return None
+
+
+# ===========================================================================
+# 60K label functions (XQ-standard cut points)
+# ===========================================================================
+
 def _get_60k_label(ts: pd.Timestamp) -> pd.Timestamp:
     """
-    Map a 1-min bar timestamp to its XQ-standard 60K bar label.
+    Map a TXF 1-min bar to its XQ-standard 60K bar label.
 
-    XQ uses two different cut-points depending on the session:
+    Day session (cut at :46):
+      08:45 → 09:45,  09:46 → 10:45,  …,  12:46 → 13:45
 
-    Day session (08:45–13:45) — cut at :46 past each hour
-    ┌─────────────────────────────┬──────────┐
-    │  1-min bars included        │  Label   │
-    ├─────────────────────────────┼──────────┤
-    │  08:45* → 09:45             │  09:45   │  * session open (special case)
-    │  09:46  → 10:45             │  10:45   │
-    │  10:46  → 11:45             │  11:45   │
-    │  11:46  → 12:45             │  12:45   │
-    │  12:46  → 13:45             │  13:45   │
-    └─────────────────────────────┴──────────┘
-
-    Night session (15:00–05:00) — cut at :01 past each hour
-    ┌─────────────────────────────┬──────────┐
-    │  1-min bars included        │  Label   │
-    ├─────────────────────────────┼──────────┤
-    │  15:00* → 16:00             │  16:00   │  * session open (special case)
-    │  16:01  → 17:00             │  17:00   │
-    │  …                          │  …       │
-    │  23:01  → 00:00 (next day)  │  00:00   │
-    │  00:01  → 01:00             │  01:00   │
-    │  04:01  → 05:00             │  05:00   │
-    └─────────────────────────────┴──────────┘
-
-    Returns ``pd.NaT`` for timestamps outside any trading session so that
-    _resample_60min() can filter them out with a simple notna() check.
+    Night session (cut at :01):
+      15:00 → 16:00,  16:01 → 17:00,  …,  04:01 → 05:00
     """
-    t   = ts.time()
-    fl  = ts.floor("min")   # strip sub-minute precision (safe for any tz)
+    t  = ts.time()
+    fl = ts.floor("min")
 
     session = _get_trading_session(t)
     if session is None:
         return pd.NaT
 
-    # ── Day session: cut at :46 ───────────────────────────────────────────
     if session == "day":
         if t.minute >= 46 or (t.hour == 8 and t.minute == 45):
-            # Belongs to the bar whose RIGHT boundary is (hour+1):45
             return fl.replace(hour=t.hour + 1, minute=45)
         else:
-            # Belongs to the bar whose RIGHT boundary is hour:45
             return fl.replace(minute=45)
-
-    # ── Night session: cut at :01 ─────────────────────────────────────────
     else:
         if t.minute == 0 and t.hour != 15:
-            # The :00 bar closes the current group — label is this :00
             return fl
         else:
-            # minute >= 1, OR 15:00 (session open) → label is NEXT :00
-            # Using arithmetic handles midnight crossing transparently.
             return (fl + pd.Timedelta(hours=1)).replace(minute=0)
+
+
+def _get_60k_label_spot(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    Map a TSE/OTC spot index 1-min bar to its 60K label.
+
+    Cut convention (cut at :01 → :00, session open grouped into first bar):
+      09:00 → 10:00  (session open included in first full hour)
+      09:01–10:00  → 10:00
+      10:01–11:00  → 11:00
+      11:01–12:00  → 12:00
+      12:01–13:00  → 13:00
+      13:01–13:30  → 13:30  (partial last bar)
+    """
+    t  = ts.time()
+    fl = ts.floor("min")
+
+    if not (_SPOT_DAY_START <= t <= _SPOT_DAY_END):
+        return pd.NaT
+
+    # Partial last bar: 13:01–13:30 → label 13:30
+    if dtime(13, 0) < t <= dtime(13, 30):
+        return fl.replace(hour=13, minute=30)
+
+    # :00 bar closes the current group (except 09:00 which opens the session)
+    if t.minute == 0 and t.hour != 9:
+        return fl
+    else:
+        # 09:00 (session open) or minute >= 1 → next :00
+        return (fl + pd.Timedelta(hours=1)).replace(minute=0)
 
 
 # ===========================================================================
@@ -151,6 +165,11 @@ def _get_api() -> "sj.Shioaji":
     if _api is None:
         _api = _create_and_login()
     return _api
+
+
+def init_api() -> None:
+    """Eagerly initialize the Shioaji API singleton. Call once at startup."""
+    _get_api()
 
 
 def _create_and_login() -> "sj.Shioaji":
@@ -170,8 +189,6 @@ def _create_and_login() -> "sj.Shioaji":
         logger.error("Shioaji login failed: %s", exc)
         raise RuntimeError(f"Shioaji login failed: {exc}") from exc
 
-    # Sync contract list — call without arguments for broadest compatibility.
-    # Some Shioaji versions lack sj.constant.ContractType; catch gracefully.
     try:
         api.fetch_contracts()
         logger.info("Shioaji fetch_contracts completed.")
@@ -191,21 +208,13 @@ def _logout(api: "sj.Shioaji") -> None:
 
 
 # ===========================================================================
-# Internal helpers
+# Data normalisation
 # ===========================================================================
 
 def _normalise(kbars) -> pd.DataFrame:
     """
-    Convert a Shioaji Kbars object to a clean 1-min OHLCV DataFrame.
-
-    1. Unpack kbars → DataFrame
-    2. Normalise column names (lowercase → Title-Case)
-    3. ts → tz-aware Asia/Taipei DatetimeIndex
-       Shioaji ts is nanoseconds of CST wall-clock time (not UTC); we
-       localise directly to Asia/Taipei without UTC conversion.
-    4. Filter to TXF session windows
-    5. Drop zero-volume placeholder bars
-    6. Sort ascending, promote index to 'Datetime' column
+    Convert Shioaji Kbars to a clean 1-min OHLCV DataFrame (TXF futures).
+    Filters to TXF session windows and drops zero-volume bars.
     """
     df = pd.DataFrame({**kbars})
     if df.empty:
@@ -213,11 +222,8 @@ def _normalise(kbars) -> pd.DataFrame:
 
     df.columns = [c.lower() for c in df.columns]
     df = df.rename(columns={
-        "open":   "Open",
-        "high":   "High",
-        "low":    "Low",
-        "close":  "Close",
-        "volume": "Volume",
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
     })
 
     required = ["Open", "High", "Low", "Close", "Volume"]
@@ -234,13 +240,11 @@ def _normalise(kbars) -> pd.DataFrame:
     df["Datetime"] = dt_index
     df = df.set_index("Datetime")[required].copy()
 
-    # Filter to TXF trading sessions (drop closed-window bars)
+    # Filter to TXF session windows
     session_mask = pd.Series(df.index.time, index=df.index).apply(
         lambda t: _get_trading_session(t) is not None
     )
     df = df[session_mask.values]
-
-    # Drop Shioaji zero-volume placeholder bars
     df = df[df["Volume"] > 0]
 
     df = df.dropna(subset=["Close"]).sort_index()
@@ -248,44 +252,71 @@ def _normalise(kbars) -> pd.DataFrame:
     return df.reset_index()
 
 
+def _normalise_spot(kbars) -> pd.DataFrame:
+    """
+    Convert Shioaji Kbars to a clean 1-min OHLCV DataFrame (spot index).
+    Filters to 09:00–13:30 session.
+    """
+    df = pd.DataFrame({**kbars})
+    if df.empty:
+        return df
+
+    df.columns = [c.lower() for c in df.columns]
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    })
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Shioaji kbars response is missing columns: {missing}")
+
+    ts_col = df["ts"]
+    if pd.api.types.is_integer_dtype(ts_col):
+        dt_index = pd.to_datetime(ts_col, unit="ns").dt.tz_localize("Asia/Taipei")
+    else:
+        dt_index = pd.to_datetime(ts_col).dt.tz_localize("Asia/Taipei")
+
+    df["Datetime"] = dt_index
+    df = df.set_index("Datetime")[required].copy()
+
+    # Filter to spot session (09:00–13:30)
+    session_mask = pd.Series(df.index.time, index=df.index).apply(
+        lambda t: _get_spot_trading_session(t) is not None
+    )
+    df = df[session_mask.values]
+
+    # Drop zero-volume bars only if the column has any non-zero values
+    # (some index contracts return volume; others may not)
+    if df["Volume"].sum() > 0:
+        df = df[df["Volume"] > 0]
+
+    df = df.dropna(subset=["Close"]).sort_index()
+    df.index.name = "Datetime"
+    return df.reset_index()
+
+
+# ===========================================================================
+# Resample functions
+# ===========================================================================
+
 def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
-    Resample 1-min OHLCV to *timeframe* with session isolation, aligned to XQ.
+    Resample TXF 1-min OHLCV to *timeframe* with session isolation.
 
-    Bin convention (closed='right', label='right')
-    -----------------------------------------------
-    - 5-min bar labelled 08:50 contains 1-min bars 08:46–08:50.
-    - The session-opening 1-min bar (08:45) falls into the bin (08:40, 08:45]
-      labelled 08:45 — one candle, matching XQ's first bar of the day.
-    - 5-min: 45 % 5 == 0, so bins naturally land on :45, :50, :55 …
-      → no offset adjustment needed.
-    - 60-min: default bins land on :00 (08:00, 09:00, …).
-      → offset='45min' (pandas ≥ 1.1) or base=45 (older) shifts them to
-        :45, giving bins (07:45, 08:45], (08:45, 09:45], … as XQ expects.
-
-    Session isolation
-    -----------------
-    A new block starts whenever the gap between adjacent 1-min bars exceeds
-    _SESSION_GAP (70 min), covering both the 05:00–08:45 and 13:45–15:00
-    closed windows.  Each block is resampled independently so no bin ever
-    straddles a session break.
-
-    Parameters
-    ----------
-    df_1min   : DataFrame with 'Datetime' column (tz-aware Asia/Taipei).
-    timeframe : Pandas offset alias: "5min", "15min", "30min", "60min" …
+    Uses offset='45min' (pandas ≥ 1.1) to align bins to TXF's 08:45 open.
+    Blocks are split at session gaps > _SESSION_GAP so no bin straddles
+    the 05:00–08:45 or 13:45–15:00 closed windows.
     """
     df = df_1min.copy()
-
     if "Datetime" in df.columns:
         df = df.set_index("Datetime")
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     df = df.sort_index()
 
-    # ── Session guard (belt-and-suspenders) ───────────────────────────────
-    # _normalise() already filters out closed-window bars; this guard makes
-    # _resample_session_aware() safe to call with any upstream DataFrame.
+    # Belt-and-suspenders: filter to TXF session
     session_mask = pd.Series(df.index.time, index=df.index).apply(
         lambda t: _get_trading_session(t) is not None
     )
@@ -295,35 +326,21 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
             columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
         )
 
-    # ── Step 1: assign session block IDs ──────────────────────────────────
+    agg_rules = {
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }
+
     time_diffs = df.index.to_series().diff()
     new_block  = (time_diffs > _SESSION_GAP) | time_diffs.isna()
     df["_block"] = new_block.cumsum()
 
-    agg_rules = {
-        "Open":   "first",
-        "High":   "max",
-        "Low":    "min",
-        "Close":  "last",
-        "Volume": "sum",
-    }
-
-    # ── Build resample kwargs ──────────────────────────────────────────────
-    # closed='right' + label='right': the right boundary is the bin label.
-    #
-    # offset='45min' aligns bins to TXF's 08:45 open:
-    #   5-min  : 45 % 5 == 0, so default bins already hit :45.
-    #            Adding offset='45min' is mathematically identical to the
-    #            default but makes the intent explicit.
-    #   60-min : default bins land at :00 (08:00, 09:00 …).
-    #            offset='45min' shifts them to :45 (08:45, 09:45 …) ← required.
     rs_kwargs: dict = {"closed": "right", "label": "right"}
     if _PD_GTE_1_1:
-        rs_kwargs["offset"] = "45min"       # pandas >= 1.1
+        rs_kwargs["offset"] = "45min"
     else:
-        rs_kwargs["base"] = 45              # pandas < 1.1 (base in minutes)
+        rs_kwargs["base"] = 45
 
-    # ── Step 2: resample each block independently ──────────────────────────
     blocks: list[pd.DataFrame] = []
     for _, block_df in df.groupby("_block", sort=True):
         resampled = (
@@ -331,15 +348,69 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
             .resample(timeframe, **rs_kwargs)
             .agg(agg_rules)
         )
-        # Drop empty bins (zero-volume rows that resample inserts as padding)
         resampled = resampled[resampled["Volume"] > 0].dropna(how="all")
         if not resampled.empty:
             blocks.append(resampled)
 
     if not blocks:
-        return pd.DataFrame(columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
 
-    # ── Step 3: concatenate and return ────────────────────────────────────
+    df_out = pd.concat(blocks).sort_index()
+    df_out.index.name = "Datetime"
+    return df_out.reset_index()
+
+
+def _resample_spot(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Resample spot index 1-min OHLCV to *timeframe*.
+
+    Uses standard bins (no 45-min offset) with block-based session isolation.
+    Assumes data has already been filtered to spot session hours.
+    """
+    df = df_1min.copy()
+    if "Datetime" in df.columns:
+        df = df.set_index("Datetime")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
+
+    agg_rules = {
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }
+
+    time_diffs = df.index.to_series().diff()
+    new_block  = (time_diffs > _SESSION_GAP) | time_diffs.isna()
+    df["_block"] = new_block.cumsum()
+
+    # Standard bins for spot (no offset — 09:00, 09:05, 09:10 …)
+    rs_kwargs: dict = {"closed": "right", "label": "right"}
+
+    blocks: list[pd.DataFrame] = []
+    for _, block_df in df.groupby("_block", sort=True):
+        resampled = (
+            block_df.drop(columns=["_block"])
+            .resample(timeframe, **rs_kwargs)
+            .agg(agg_rules)
+        )
+        resampled = resampled.dropna(how="all")
+        if df["Volume"].sum() > 0:
+            resampled = resampled[resampled["Volume"] > 0]
+        if not resampled.empty:
+            blocks.append(resampled)
+
+    if not blocks:
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
+
     df_out = pd.concat(blocks).sort_index()
     df_out.index.name = "Datetime"
     return df_out.reset_index()
@@ -347,24 +418,13 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
 
 def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
     """
-    Resample 1-min OHLCV to 60-min bars using XQ's TXF-specific cut-points.
+    Resample TXF 1-min OHLCV to 60-min using XQ's TXF-specific cut points.
 
-    This replaces pd.resample('60min') which would apply a uniform cut at
-    :00 of each hour, misaligning both the day-session (should cut at :46)
-    and the first bar of the night-session (15:00 must merge into 16:00).
-
-    Implementation
-    --------------
-    1. Map every 1-min bar to its 60K label via _get_60k_label().
-    2. groupby(label).agg(OHLCV rules) — one pass, no bin-padding artefacts.
-    3. Drop zero-volume / all-NaN rows.
-
-    MA lines MUST be calculated on the resulting 60K DataFrame, not on the
-    1-min source.  The renderer already does this (rolling on the full df
-    before slicing to the display window).
+    Day session: cut at :46 (bins labelled :45)
+    Night session: cut at :01 (bins labelled :00)
+    Uses composite key (session, label) to prevent cross-gap merges.
     """
     df = df_1min.copy()
-
     if "Datetime" in df.columns:
         df = df.set_index("Datetime")
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -372,23 +432,17 @@ def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
 
     agg_rules = {
-        "Open":   "first",
-        "High":   "max",
-        "Low":    "min",
-        "Close":  "last",
-        "Volume": "sum",
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
     }
 
-    # Compute session tag and 60K label for every 1-min bar.
     sessions = pd.Series(
         [_get_trading_session(ts.time()) for ts in df.index],
         index=df.index,
     )
     labels = df.index.map(_get_60k_label)
 
-    # Drop bars outside any trading session (belt-and-suspenders on top of
-    # the filter already applied in _normalise()).
-    valid = sessions.notna() & labels.notna()
+    valid    = sessions.notna() & labels.notna()
     df       = df[valid]
     sessions = sessions[valid]
     labels   = labels[valid]
@@ -398,10 +452,6 @@ def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
             columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
         )
 
-    # Composite key (session, label) ensures day-session bars and night-session
-    # bars are never merged into the same 60K candle, even if their label
-    # timestamps were somehow identical (impossible in practice, but explicit
-    # here as a correctness guarantee).
     df = df.copy()
     df["_session"] = sessions.values
     df["_label"]   = labels.values
@@ -412,9 +462,52 @@ def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
         .dropna(how="all")
     )
     df_out = df_out[df_out["Volume"] > 0]
-
-    # Flatten the (session, label) MultiIndex — keep only the label timestamp
     df_out = df_out.reset_index(level="_session", drop=True)
+    df_out.index.name = "Datetime"
+    return df_out.sort_index().reset_index()
+
+
+def _resample_60min_spot(df_1min: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample spot index 1-min OHLCV to 60-min using spot-specific cut points.
+
+    09:00 → grouped into 10:00 bar (first full hour)
+    10:01–11:00 → 11:00, etc.
+    13:01–13:30 → 13:30 (partial last bar)
+    """
+    df = df_1min.copy()
+    if "Datetime" in df.columns:
+        df = df.set_index("Datetime")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    agg_rules = {
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }
+
+    labels = df.index.map(_get_60k_label_spot)
+    valid  = labels.notna()
+    df     = df[valid]
+    labels = labels[valid]
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
+
+    df = df.copy()
+    df["_label"] = labels.values
+
+    df_out = (
+        df.groupby("_label")
+        .agg(agg_rules)
+        .dropna(how="all")
+    )
+    if df["Volume"].sum() > 0:
+        df_out = df_out[df_out["Volume"] > 0]
+
     df_out.index.name = "Datetime"
     return df_out.sort_index().reset_index()
 
@@ -425,22 +518,18 @@ def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
 
 class ShioajiDataFetcher:
     """
-    Fetches 台指期貨近一連續合約 (TXFR1) K-line data from Shioaji.
+    Fetches K-line data from Shioaji for:
+      - TXFR1   : 台指期貨近一連續合約
+      - TSE/001 : 加權指數
+      - OTC/101 : 櫃買指數
 
-    1-min bars are fetched from the exchange; resampling to 5-min or 60-min
-    is done locally with session-isolated aggregation to avoid cross-gap bars.
-
-    Usage
-    -----
-    fetcher = ShioajiDataFetcher()
-    df_5k  = fetcher.fetch_bars("5min",  bars=200)
-    df_60k = fetcher.fetch_bars("60min", bars=100)
+    The Shioaji API is a module-level singleton (login once at startup).
+    1-min bars are fetched from the exchange and resampled locally.
     """
 
-    _CONTRACT_CODE = "TXFR1"
-
-    def __init__(self, symbol: str = _CONTRACT_CODE) -> None:
-        self._symbol       = symbol
+    def __init__(self, symbol: str = "TXFR1") -> None:
+        self._symbol      = symbol
+        self._is_spot     = symbol in _SPOT_SYMBOLS
         self._latest_close: "float | None" = None
 
     # ------------------------------------------------------------------
@@ -457,21 +546,17 @@ class ShioajiDataFetcher:
         """
         Fetch K-line bars at *timeframe* resolution.
 
-        Internally fetches 1-min kbars (the only resolution supported by
-        this Shioaji version) then resamples with session isolation.
-
         Parameters
         ----------
-        timeframe : str   "1min", "5min", "10min", "15min", "30min", "60min".
-        bars      : int   Maximum resampled bars to return (most recent N).
-        start     : str   Date string "yyyy-mm-dd". Auto-derived if omitted.
-        end       : str   Date string "yyyy-mm-dd". Defaults to today.
+        timeframe : "1min", "5min", "10min", "15min", "30min", "60min"
+        bars      : Maximum resampled bars to return (most recent N).
+        start     : Date string "yyyy-mm-dd". Auto-derived if omitted.
+        end       : Date string "yyyy-mm-dd". Defaults to today.
 
         Returns
         -------
-        pd.DataFrame
-            Columns: Datetime (tz-aware Asia/Taipei), Open, High, Low,
-            Close, Volume.
+        pd.DataFrame with columns: Datetime (tz-aware Asia/Taipei),
+        Open, High, Low, Close, Volume.
         """
         supported = {"1min", "5min", "10min", "15min", "30min", "60min"}
         if timeframe not in supported:
@@ -479,26 +564,25 @@ class ShioajiDataFetcher:
                 f"Unsupported timeframe '{timeframe}'. Supported: {sorted(supported)}"
             )
 
-        # How many 1-min bars do we need to produce *bars* resampled bars?
-        min_per_bar   = int(timeframe.replace("min", "")) if timeframe != "1min" else 1
-        needed_1min   = bars * min_per_bar
-        # Add 50 % buffer for session gaps and non-trading minutes
-        needed_1min   = int(needed_1min * 1.5)
+        min_per_bar = int(timeframe.replace("min", "")) if timeframe != "1min" else 1
+        needed_1min = int(bars * min_per_bar * 1.5)
 
         today = date.today()
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            trading_days = math.ceil(needed_1min / _TRADING_MIN_PER_DAY)
-            lookback     = math.ceil(trading_days * 7 / 5) + 10
+            # Spot has shorter session → use a conservative per-day estimate
+            mins_per_day  = 270 if self._is_spot else _TRADING_MIN_PER_DAY
+            trading_days  = math.ceil(needed_1min / mins_per_day)
+            lookback      = math.ceil(trading_days * 7 / 5) + 10
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         api      = _get_api()
         contract = self._get_contract(api)
 
         logger.info(
-            "Fetching 1-min kbars: TXFR1  %s → %s  (need ~%d 1-min bars for %d %s bars)",
-            start, end, needed_1min, bars, timeframe,
+            "Fetching 1-min kbars: %s  %s → %s  (need ~%d 1-min bars for %d %s bars)",
+            self._symbol, start, end, needed_1min, bars, timeframe,
         )
 
         try:
@@ -507,74 +591,117 @@ class ShioajiDataFetcher:
             exc_str = str(exc).lower()
             if "permission" in exc_str or "unauthorized" in exc_str or "403" in exc_str:
                 logger.error(
-                    "❌ 期貨資料權限尚未開通！\n"
-                    "   請至永豐金證券後台確認帳號已申請「期貨行情資料」權限。\n"
-                    "   原始錯誤: %s",
-                    exc,
+                    "資料權限尚未開通！(%s)\n原始錯誤: %s", self._symbol, exc
                 )
                 raise PermissionError(
-                    f"Shioaji 期貨資料權限不足 (Permission Denied): {exc}"
+                    f"Shioaji 資料權限不足 ({self._symbol}): {exc}"
                 ) from exc
             logger.error("api.kbars() raised: %s", exc)
-            raise RuntimeError(f"Shioaji kbars fetch failed: {exc}") from exc
+            raise RuntimeError(f"Shioaji kbars fetch failed ({self._symbol}): {exc}") from exc
 
-        df_1min = _normalise(kbars)
+        # Normalise based on symbol type
+        if self._is_spot:
+            df_1min = _normalise_spot(kbars)
+        else:
+            df_1min = _normalise(kbars)
 
         if df_1min.empty:
             raise ValueError(
-                f"No kbar data returned for TXFR1 ({start} → {end})"
+                f"No kbar data returned for {self._symbol} ({start} → {end})"
             )
 
-        logger.info("Fetched %d 1-min bars from exchange.", len(df_1min))
+        logger.info("Fetched %d 1-min bars from exchange (%s).", len(df_1min), self._symbol)
 
-        # ── Resample ──────────────────────────────────────────────────────
+        # Resample
         if timeframe == "1min":
             df_out = df_1min
         elif timeframe == "60min":
-            # Custom groupby — day/night sessions use different cut-points
-            df_out = _resample_60min(df_1min)
+            if self._is_spot:
+                df_out = _resample_60min_spot(df_1min)
+            else:
+                df_out = _resample_60min(df_1min)
             logger.info(
-                "Custom 60K groupby: %d bars (from %d 1-min bars)",
-                len(df_out), len(df_1min),
+                "60K resample (%s): %d bars (from %d 1-min bars)",
+                self._symbol, len(df_out), len(df_1min),
             )
         else:
-            # 5min and other timeframes: session-isolated resample with offset
-            df_out = _resample_session_aware(df_1min, timeframe)
+            if self._is_spot:
+                df_out = _resample_spot(df_1min, timeframe)
+            else:
+                df_out = _resample_session_aware(df_1min, timeframe)
             logger.info(
-                "Session-aware resample → %s: %d bars (from %d 1-min bars)",
-                timeframe, len(df_out), len(df_1min),
+                "Session-aware resample → %s (%s): %d bars (from %d 1-min bars)",
+                timeframe, self._symbol, len(df_out), len(df_1min),
             )
 
         if df_out.empty:
             raise ValueError(
-                f"Resample to {timeframe} produced no bars for TXFR1 ({start} → {end})"
+                f"Resample to {timeframe} produced no bars for {self._symbol}"
             )
 
-        # Keep most recent N bars
         if len(df_out) > bars:
             df_out = df_out.iloc[-bars:].reset_index(drop=True)
 
         self._latest_close = float(df_out["Close"].iloc[-1])
         logger.info(
-            "fetch_bars(%s): returning %d bars | latest close = %.0f",
-            timeframe, len(df_out), self._latest_close,
+            "fetch_bars(%s, %s): returning %d bars | latest close = %.0f",
+            self._symbol, timeframe, len(df_out), self._latest_close,
         )
         return df_out
 
     def get_latest_price(self) -> float:
-        """Return the most recently fetched close price."""
         if self._latest_close is None:
             df = self.fetch_bars("5min", bars=2)
             return float(df["Close"].iloc[-1])
         return self._latest_close
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Contract lookup
     # ------------------------------------------------------------------
 
+    def _get_contract(self, api: "sj.Shioaji"):
+        if self._is_spot:
+            return self._get_spot_contract(api)
+        return self._get_futures_contract(api)
+
+    def _get_spot_contract(self, api: "sj.Shioaji"):
+        """Locate TSE/001 or OTC/101 index contract in Shioaji."""
+        market, code = _SPOT_SYMBOLS[self._symbol]
+
+        # Try multiple attribute names for different Shioaji versions
+        indexs_group = None
+        for attr in ("Indexs", "Index", "indexes"):
+            indexs_group = getattr(api.Contracts, attr, None)
+            if indexs_group is not None:
+                break
+
+        if indexs_group is None:
+            raise RuntimeError(
+                f"無法找到 Index 合約群組。\n"
+                f"  請確認 Shioaji 版本並已成功 fetch_contracts()。\n"
+                f"  Symbol: {self._symbol}"
+            )
+
+        market_group = getattr(indexs_group, market, None)
+        if market_group is None:
+            available = [a for a in dir(indexs_group) if not a.startswith("_")]
+            raise RuntimeError(
+                f"無法找到 {market} 在 Index 合約群組中。\n"
+                f"  可用群組: {available}"
+            )
+
+        contract = getattr(market_group, code, None)
+        if contract is None:
+            available = [a for a in dir(market_group) if not a.startswith("_")]
+            raise RuntimeError(
+                f"無法找到合約 {code} 在 {market} 群組中。\n"
+                f"  可用合約: {available}"
+            )
+        return contract
+
     @staticmethod
-    def _get_contract(api: "sj.Shioaji"):
-        """Locate the TXFR1 contract object with a descriptive error on failure."""
+    def _get_futures_contract(api: "sj.Shioaji"):
+        """Locate TXFR1 futures contract in Shioaji."""
         txf_group = getattr(api.Contracts.Futures, "TXF", None)
         contract  = getattr(txf_group, "TXFR1", None) if txf_group is not None else None
 
@@ -602,12 +729,13 @@ YFinanceDataFetcher = ShioajiDataFetcher
 # ===========================================================================
 
 def fetch_data(
-    timeframe: str = "5min",
+    symbol:    str  = "TXFR1",
+    timeframe: str  = "5min",
     bars:      int  = 200,
     start:     "str | None" = None,
     end:       "str | None" = None,
 ) -> pd.DataFrame:
-    """Fetch TXFR1 K-line data at the given resolution."""
-    return ShioajiDataFetcher().fetch_bars(
+    """Fetch K-line data for *symbol* at the given resolution."""
+    return ShioajiDataFetcher(symbol).fetch_bars(
         timeframe=timeframe, bars=bars, start=start, end=end
     )
