@@ -55,12 +55,12 @@ from renderer import render_chart                           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-# 2330 trades 09:00–13:30 = 270 min/day.
-# MA240 on 60K requires 240 × 60 = 14,400 1-min bars (≈ 53 trading days).
-# 15,000 adds a small buffer on top.
-_FETCH_PERIODS_1MIN = 15_000
-_DATA_SYMBOL        = "2330"   # TSMC spot (proxy while TX Futures perms pending)
-_DATA_LABEL         = "2330 台積電 (spot)"
+# TXF trades ~480 min/day (day 300 min + night ~180 min average).
+# MA240 on 60K requires 240 × 60 = 14,400 1-min bars (≈ 30 trading days).
+# 20,000 adds a comfortable buffer; fetcher defaults to 50 calendar days.
+_FETCH_PERIODS_1MIN = 20_000
+_DATA_SYMBOL        = "TXF00"  # 台指期貨近月連續合約
+_DATA_LABEL         = "台指期貨近月 TXF (TXF00)"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,7 @@ def run_job() -> None:
 
     try:
         # ── Fetch ──────────────────────────────────────────────────────────
-        logger.info("Fetching %d 1-min bars via Shioaji (%s)...", _FETCH_PERIODS_1MIN, _DATA_SYMBOL)
+        logger.info("Fetching %d 1-min bars via Shioaji (%s — 台指期近月連續合約)...", _FETCH_PERIODS_1MIN, _DATA_SYMBOL)
         fetcher = ShioajiDataFetcher(symbol=_DATA_SYMBOL)
         df_1min = fetcher.fetch_1min_bars(periods=_FETCH_PERIODS_1MIN)
 
