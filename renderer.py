@@ -194,7 +194,7 @@ def render_chart(
         title=title,
         volume=True,
         figsize=(18, 10),
-        savefig={"fname": str(filepath), "dpi": 150, "bbox_inches": "tight"},
+        returnfig=True,          # We save manually so we can post-process doji colour
         warn_too_much_data=10_000,
         show_nontrading=False,   # suppress weekend/holiday blank columns
     )
@@ -202,7 +202,9 @@ def render_chart(
         plot_kwargs["addplot"] = addplots
 
     try:
-        mpf.plot(df_display, **plot_kwargs)
+        fig, axes = mpf.plot(df_display, **plot_kwargs)
+        _color_doji_candles(axes[0], df_display)
+        fig.savefig(str(filepath), dpi=150, bbox_inches="tight")
         plt.close("all")  # Release memory after saving
         logger.info("Chart saved → %s", filepath)
         return filepath
@@ -239,6 +241,31 @@ def _build_ma_addplots(df: pd.DataFrame) -> list:
                 mpf.make_addplot(series, color=color, width=width, secondary_y=False)
             )
     return result
+
+
+def _color_doji_candles(ax, df: pd.DataFrame, color: str = "#FFD700") -> None:
+    """
+    Recolour candle bodies where Open == Close (doji) to *color* (default gold).
+
+    mplfinance renders each candle body as a ``matplotlib.patches.Rectangle``
+    in the price axis, in the same order as the DataFrame rows.  We iterate
+    over those patches and repaint any whose corresponding bar is a doji.
+
+    Parameters
+    ----------
+    ax    : the primary (price) Axes returned by ``mpf.plot(..., returnfig=True)``
+    df    : the OHLCV DataFrame that was passed to ``mpf.plot()``
+    color : any matplotlib colour string / hex; defaults to gold (#FFD700)
+    """
+    patches = ax.patches
+    if not patches:
+        return
+    opens  = df["Open"].values
+    closes = df["Close"].values
+    for i, (o, c) in enumerate(zip(opens, closes)):
+        if o == c and i < len(patches):
+            patches[i].set_facecolor(color)
+            patches[i].set_edgecolor(color)
 
 
 def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
