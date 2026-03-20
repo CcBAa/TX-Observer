@@ -55,12 +55,11 @@ from renderer import render_chart                           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-# TXF trades ~480 min/day (day 300 min + night ~180 min average).
-# MA240 on 60K requires 240 × 60 = 14,400 1-min bars (≈ 30 trading days).
-# 20,000 adds a comfortable buffer; fetcher defaults to 50 calendar days.
-_FETCH_PERIODS_1MIN = 20_000
-_DATA_SYMBOL        = "TXF00"  # 台指期貨近月連續合約
-_DATA_LABEL         = "台指期貨近月 TXF (TXF00)"
+# Bars fetched directly at each resolution via Shioaji api.kbars(unit=...).
+# No manual resampling — the exchange-side aggregation is authoritative.
+_BARS_5K    = 200   # 5-min bars  (~1 trading day + buffer for MA60)
+_BARS_60K   = 100   # 60-min bars (~5 trading days)
+_DATA_LABEL = "台指期貨近一 TXF (TXFR1)"
 
 
 # ---------------------------------------------------------------------------
@@ -156,19 +155,16 @@ def run_job() -> None:
     chart_5k_path:  Optional[Path] = None
 
     try:
-        # ── Fetch ──────────────────────────────────────────────────────────
-        logger.info("Fetching %d 1-min bars via Shioaji (%s — 台指期近月連續合約)...", _FETCH_PERIODS_1MIN, _DATA_SYMBOL)
-        fetcher = ShioajiDataFetcher(symbol=_DATA_SYMBOL)
-        df_1min = fetcher.fetch_1min_bars(periods=_FETCH_PERIODS_1MIN)
+        # ── Fetch (native resolution — no resampling) ──────────────────────
+        fetcher = ShioajiDataFetcher()
+        logger.info("Fetching %d 5-min bars from Shioaji (TXFR1)...", _BARS_5K)
+        df_5k  = fetcher.fetch_bars("5min",  bars=_BARS_5K)
+        logger.info("Fetching %d 60-min bars from Shioaji (TXFR1)...", _BARS_60K)
+        df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
 
-        # ── Resample ───────────────────────────────────────────────────────
-        logger.info("Resampling → 5min and 60min...")
-        df_5k  = ShioajiDataFetcher.resample_to_timeframe(df_1min, "5min")
-        df_60k = ShioajiDataFetcher.resample_to_timeframe(df_1min, "60min")
-
-        # ── Price summary ──────────────────────────────────────────────────
-        latest_close = float(df_1min["Close"].iloc[-1])
-        prev_close   = float(df_1min["Close"].iloc[-2])
+        # ── Price summary (from 5K — freshest granularity) ─────────────────
+        latest_close = float(df_5k["Close"].iloc[-1])
+        prev_close   = float(df_5k["Close"].iloc[-2])
         change       = latest_close - prev_close
         change_pct   = (change / prev_close) * 100.0 if prev_close else 0.0
         arrow        = "▲" if change >= 0 else "▼"
