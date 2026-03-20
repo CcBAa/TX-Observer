@@ -122,6 +122,10 @@ def render_chart(
 
     df_plot = _prepare_dataframe(df)
 
+    # Drop any rows with missing OHLCV values before MA computation so that
+    # rolling() produces correct averages rather than propagating NaNs.
+    df_plot = df_plot.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
     if len(df_plot) < 3:
         raise ValueError(
             f"DataFrame has only {len(df_plot)} row(s); at least 3 are required to render a chart."

@@ -61,15 +61,23 @@ _SESSION_GAP = pd.Timedelta(minutes=70)
 _TRADING_MIN_PER_DAY = 480
 
 
-def _is_in_session(t: dtime) -> bool:
-    """Return True if bar timestamp *t* falls within a TXF trading session."""
+def _get_trading_session(t: dtime) -> "str | None":
+    """
+    Classify a UTC+8 wall-clock time into a TXF trading session.
+
+    Returns
+    -------
+    'day'   — 08:45–13:45  (regular session)
+    'night' — 15:00–05:00  (after-hours, wraps midnight)
+    None    — 05:01–08:44 or 13:46–14:59 (closed periods; bar should be dropped)
+    """
     if _DAY_START <= t <= _DAY_END:
-        return True
+        return "day"
     if t >= _NIGHT_START:
-        return True
+        return "night"
     if t <= _NIGHT_END:
-        return True
-    return False
+        return "night"
+    return None
 
 
 def _get_60k_label(ts: pd.Timestamp) -> pd.Timestamp:
@@ -101,14 +109,18 @@ def _get_60k_label(ts: pd.Timestamp) -> pd.Timestamp:
     │  04:01  → 05:00             │  05:00   │
     └─────────────────────────────┴──────────┘
 
-    Note: bars outside trading sessions are already filtered by _normalise(),
-    so no additional boundary check is required here.
+    Returns ``pd.NaT`` for timestamps outside any trading session so that
+    _resample_60min() can filter them out with a simple notna() check.
     """
     t   = ts.time()
     fl  = ts.floor("min")   # strip sub-minute precision (safe for any tz)
 
+    session = _get_trading_session(t)
+    if session is None:
+        return pd.NaT
+
     # ── Day session: cut at :46 ───────────────────────────────────────────
-    if _DAY_START <= t <= _DAY_END:
+    if session == "day":
         if t.minute >= 46 or (t.hour == 8 and t.minute == 45):
             # Belongs to the bar whose RIGHT boundary is (hour+1):45
             return fl.replace(hour=t.hour + 1, minute=45)
@@ -222,8 +234,10 @@ def _normalise(kbars) -> pd.DataFrame:
     df["Datetime"] = dt_index
     df = df.set_index("Datetime")[required].copy()
 
-    # Filter to TXF trading sessions
-    session_mask = pd.Series(df.index.time, index=df.index).apply(_is_in_session)
+    # Filter to TXF trading sessions (drop closed-window bars)
+    session_mask = pd.Series(df.index.time, index=df.index).apply(
+        lambda t: _get_trading_session(t) is not None
+    )
     df = df[session_mask.values]
 
     # Drop Shioaji zero-volume placeholder bars
@@ -268,6 +282,18 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     df = df.sort_index()
+
+    # ── Session guard (belt-and-suspenders) ───────────────────────────────
+    # _normalise() already filters out closed-window bars; this guard makes
+    # _resample_session_aware() safe to call with any upstream DataFrame.
+    session_mask = pd.Series(df.index.time, index=df.index).apply(
+        lambda t: _get_trading_session(t) is not None
+    )
+    df = df[session_mask.values]
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
 
     # ── Step 1: assign session block IDs ──────────────────────────────────
     time_diffs = df.index.to_series().diff()
@@ -353,15 +379,42 @@ def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
         "Volume": "sum",
     }
 
+    # Compute session tag and 60K label for every 1-min bar.
+    sessions = pd.Series(
+        [_get_trading_session(ts.time()) for ts in df.index],
+        index=df.index,
+    )
     labels = df.index.map(_get_60k_label)
 
+    # Drop bars outside any trading session (belt-and-suspenders on top of
+    # the filter already applied in _normalise()).
+    valid = sessions.notna() & labels.notna()
+    df       = df[valid]
+    sessions = sessions[valid]
+    labels   = labels[valid]
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Datetime", "Open", "High", "Low", "Close", "Volume"]
+        )
+
+    # Composite key (session, label) ensures day-session bars and night-session
+    # bars are never merged into the same 60K candle, even if their label
+    # timestamps were somehow identical (impossible in practice, but explicit
+    # here as a correctness guarantee).
+    df = df.copy()
+    df["_session"] = sessions.values
+    df["_label"]   = labels.values
+
     df_out = (
-        df.groupby(labels)
+        df.groupby(["_session", "_label"])
         .agg(agg_rules)
         .dropna(how="all")
     )
     df_out = df_out[df_out["Volume"] > 0]
 
+    # Flatten the (session, label) MultiIndex — keep only the label timestamp
+    df_out = df_out.reset_index(level="_session", drop=True)
     df_out.index.name = "Datetime"
     return df_out.sort_index().reset_index()
 
