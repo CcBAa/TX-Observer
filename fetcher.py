@@ -72,6 +72,61 @@ def _is_in_session(t: dtime) -> bool:
     return False
 
 
+def _get_60k_label(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    Map a 1-min bar timestamp to its XQ-standard 60K bar label.
+
+    XQ uses two different cut-points depending on the session:
+
+    Day session (08:45–13:45) — cut at :46 past each hour
+    ┌─────────────────────────────┬──────────┐
+    │  1-min bars included        │  Label   │
+    ├─────────────────────────────┼──────────┤
+    │  08:45* → 09:45             │  09:45   │  * session open (special case)
+    │  09:46  → 10:45             │  10:45   │
+    │  10:46  → 11:45             │  11:45   │
+    │  11:46  → 12:45             │  12:45   │
+    │  12:46  → 13:45             │  13:45   │
+    └─────────────────────────────┴──────────┘
+
+    Night session (15:00–05:00) — cut at :01 past each hour
+    ┌─────────────────────────────┬──────────┐
+    │  1-min bars included        │  Label   │
+    ├─────────────────────────────┼──────────┤
+    │  15:00* → 16:00             │  16:00   │  * session open (special case)
+    │  16:01  → 17:00             │  17:00   │
+    │  …                          │  …       │
+    │  23:01  → 00:00 (next day)  │  00:00   │
+    │  00:01  → 01:00             │  01:00   │
+    │  04:01  → 05:00             │  05:00   │
+    └─────────────────────────────┴──────────┘
+
+    Note: bars outside trading sessions are already filtered by _normalise(),
+    so no additional boundary check is required here.
+    """
+    t   = ts.time()
+    fl  = ts.floor("min")   # strip sub-minute precision (safe for any tz)
+
+    # ── Day session: cut at :46 ───────────────────────────────────────────
+    if _DAY_START <= t <= _DAY_END:
+        if t.minute >= 46 or (t.hour == 8 and t.minute == 45):
+            # Belongs to the bar whose RIGHT boundary is (hour+1):45
+            return fl.replace(hour=t.hour + 1, minute=45)
+        else:
+            # Belongs to the bar whose RIGHT boundary is hour:45
+            return fl.replace(minute=45)
+
+    # ── Night session: cut at :01 ─────────────────────────────────────────
+    else:
+        if t.minute == 0 and t.hour != 15:
+            # The :00 bar closes the current group — label is this :00
+            return fl
+        else:
+            # minute >= 1, OR 15:00 (session open) → label is NEXT :00
+            # Using arithmetic handles midnight crossing transparently.
+            return (fl + pd.Timedelta(hours=1)).replace(minute=0)
+
+
 # ===========================================================================
 # Shioaji API singleton
 # ===========================================================================
@@ -264,6 +319,53 @@ def _resample_session_aware(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFra
     return df_out.reset_index()
 
 
+def _resample_60min(df_1min: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample 1-min OHLCV to 60-min bars using XQ's TXF-specific cut-points.
+
+    This replaces pd.resample('60min') which would apply a uniform cut at
+    :00 of each hour, misaligning both the day-session (should cut at :46)
+    and the first bar of the night-session (15:00 must merge into 16:00).
+
+    Implementation
+    --------------
+    1. Map every 1-min bar to its 60K label via _get_60k_label().
+    2. groupby(label).agg(OHLCV rules) — one pass, no bin-padding artefacts.
+    3. Drop zero-volume / all-NaN rows.
+
+    MA lines MUST be calculated on the resulting 60K DataFrame, not on the
+    1-min source.  The renderer already does this (rolling on the full df
+    before slicing to the display window).
+    """
+    df = df_1min.copy()
+
+    if "Datetime" in df.columns:
+        df = df.set_index("Datetime")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    agg_rules = {
+        "Open":   "first",
+        "High":   "max",
+        "Low":    "min",
+        "Close":  "last",
+        "Volume": "sum",
+    }
+
+    labels = df.index.map(_get_60k_label)
+
+    df_out = (
+        df.groupby(labels)
+        .agg(agg_rules)
+        .dropna(how="all")
+    )
+    df_out = df_out[df_out["Volume"] > 0]
+
+    df_out.index.name = "Datetime"
+    return df_out.sort_index().reset_index()
+
+
 # ===========================================================================
 # Public class
 # ===========================================================================
@@ -372,10 +474,18 @@ class ShioajiDataFetcher:
 
         logger.info("Fetched %d 1-min bars from exchange.", len(df_1min))
 
-        # ── Resample (or pass through for 1min) ───────────────────────────
+        # ── Resample ──────────────────────────────────────────────────────
         if timeframe == "1min":
             df_out = df_1min
+        elif timeframe == "60min":
+            # Custom groupby — day/night sessions use different cut-points
+            df_out = _resample_60min(df_1min)
+            logger.info(
+                "Custom 60K groupby: %d bars (from %d 1-min bars)",
+                len(df_out), len(df_1min),
+            )
         else:
+            # 5min and other timeframes: session-isolated resample with offset
             df_out = _resample_session_aware(df_1min, timeframe)
             logger.info(
                 "Session-aware resample → %s: %d bars (from %d 1-min bars)",
