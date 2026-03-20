@@ -69,31 +69,62 @@ def _is_in_session(t: dtime) -> bool:
 # ---------------------------------------------------------------------------
 
 def _build_unit_map() -> "dict[str, object]":
+    """
+    Build timeframe → Shioaji Unit mapping.
+
+    Strategy (in order):
+    1. Try known enum attribute names for each timeframe (version-safe).
+    2. If the enum has no matching attribute, fall back to the raw integer
+       value — Shioaji's kbars() accepts plain ints for the unit parameter.
+
+    Supported raw integer values (confirmed from Shioaji source):
+        1=1min, 5=5min, 10=10min, 15=15min, 30=30min, 60=60min, 1440=day
+    """
     U = sj.constant.Unit
+
+    # Candidate enum attribute names per timeframe (most-likely first)
     candidates: "dict[str, list[str]]" = {
-        "1min":  ["Minute", "Min1"],
-        "5min":  ["Min5",   "Minute5"],
+        "1min":  ["Minute", "Min1",   "Minutely"],
+        "5min":  ["Min5",   "Minute5", "Minutely5"],
         "10min": ["Min10",  "Minute10"],
         "15min": ["Min15",  "Minute15"],
         "30min": ["Min30",  "Minute30"],
-        "60min": ["Hour",   "Min60",  "Minute60"],
-        "day":   ["Day",    "Daily"],
+        "60min": ["Hour",   "Min60",  "Hourly",  "Minute60"],
+        "day":   ["Day",    "Daily",  "Daily1"],
     }
+
+    # Fallback: raw integer values accepted by api.kbars(unit=<int>)
+    int_fallback: "dict[str, int]" = {
+        "1min": 1, "5min": 5, "10min": 10,
+        "15min": 15, "30min": 30, "60min": 60, "day": 1440,
+    }
+
+    # Log all available members once so users can diagnose version issues
+    available = [m for m in dir(U) if not m.startswith("_")]
+    logger.debug("sj.constant.Unit members available: %s", available)
+
     result: dict = {}
     for tf, names in candidates.items():
+        # Try enum members first
         for name in names:
             unit = getattr(U, name, None)
             if unit is not None:
                 result[tf] = unit
+                logger.debug("Unit map: '%s' → Unit.%s (%r)", tf, name, unit)
                 break
+        else:
+            # Fall back to raw integer
+            fallback = int_fallback.get(tf)
+            if fallback is not None:
+                result[tf] = fallback
+                logger.debug(
+                    "Unit map: '%s' → int(%d)  [no matching enum member found]",
+                    tf, fallback,
+                )
+
     return result
 
 _UNIT_MAP = _build_unit_map()
-# Log resolved units at import time so mismatches are caught early
-logger.debug(
-    "Shioaji Unit map resolved: %s",
-    {k: v for k, v in _UNIT_MAP.items()},
-)
 
 # Conservative estimate of tradeable minutes per day for TXF
 # (day 300 min + average night tail ~180 min = 480)
