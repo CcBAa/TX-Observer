@@ -1,7 +1,7 @@
 """
 fetcher.py — Data fetching and resampling for TX-Observer.
 
-Uses Shioaji (永豐金 API) to fetch 台指期貨近月連續合約 (TXF00) 1-minute
+Uses Shioaji (永豐金 API) to fetch 台指期貨近月連續合約 (TXFR1) 1-minute
 OHLCV bars, covering both the day session (08:45–13:45) and the night session
 (15:00–next-day 05:00).
 
@@ -98,6 +98,13 @@ def _create_and_login() -> "sj.Shioaji":
         logger.error("Shioaji login failed: %s", exc)
         raise RuntimeError(f"Shioaji login failed: {exc}") from exc
 
+    # 同步合約清單，確保 Contracts.Futures.TXF.TXFR1 等屬性存在
+    try:
+        api.fetch_contracts(contract_type=sj.constant.ContractType.Future)
+        logger.info("Shioaji fetch_contracts (Futures) completed.")
+    except Exception as exc:
+        logger.warning("fetch_contracts 失敗，合約屬性可能不完整: %s", exc)
+
     atexit.register(_logout, api)
     return api
 
@@ -116,7 +123,7 @@ def _logout(api: "sj.Shioaji") -> None:
 
 class ShioajiDataFetcher:
     """
-    Fetches 台指期貨近月連續合約 (TXF00) 1-minute OHLCV bars from Shioaji.
+    Fetches 台指期貨近一連續合約 (TXFR1) 1-minute OHLCV bars from Shioaji.
 
     Usage
     -----
@@ -127,10 +134,10 @@ class ShioajiDataFetcher:
     """
 
     # Contract code for 台指期近月連續合約
-    _CONTRACT_CODE = "TXF00"
+    _CONTRACT_CODE = "TXFR1"
 
     def __init__(self, symbol: str = _CONTRACT_CODE) -> None:
-        # symbol is kept for display / logging; contract lookup always uses TXF00
+        # symbol is kept for display / logging; contract lookup always uses TXFR1
         self._symbol = symbol
         self._latest_close: "float | None" = None
 
@@ -145,7 +152,7 @@ class ShioajiDataFetcher:
         end:     "str | None" = None,
     ) -> pd.DataFrame:
         """
-        Fetch the most recent 1-minute bars for TXF00.
+        Fetch the most recent 1-minute bars for TXFR1 (台指期近一連續合約).
 
         Parameters
         ----------
@@ -180,15 +187,22 @@ class ShioajiDataFetcher:
         api = _get_api()
 
         # ── Locate the contract ──────────────────────────────────────────
-        try:
-            contract = api.Contracts.Futures.TXF.TXF00
-        except AttributeError as exc:
+        # 使用 getattr 防呆：若 API 改版導致屬性名稱變動，給出明確錯誤訊息
+        txf_group = getattr(api.Contracts.Futures, "TXF", None)
+        contract  = getattr(txf_group, "TXFR1", None) if txf_group is not None else None
+
+        if contract is None:
+            # 列出現有屬性輔助診斷
+            available = dir(txf_group) if txf_group is not None else []
+            futures_hint = [a for a in available if a.startswith("TXF")]
             raise RuntimeError(
-                "無法取得 TXF00 合約物件。請確認 Shioaji 版本與帳號期貨資料權限。"
-            ) from exc
+                "無法取得 TXFR1 合約物件。\n"
+                f"  api.Contracts.Futures.TXF 下可見的合約: {futures_hint or '(空，可能需要先呼叫 fetch_contracts)'}\n"
+                "  請確認 Shioaji 版本 (>= 1.1) 並已呼叫 api.fetch_contracts()。"
+            )
 
         logger.info(
-            "Fetching 1-min kbars: TXF00 (台指期近月連續合約)  %s → %s", start, end
+            "Fetching 1-min kbars: TXFR1 (台指期近一連續合約)  %s → %s", start, end
         )
 
         # ── Call kbars ──────────────────────────────────────────────────
@@ -214,11 +228,11 @@ class ShioajiDataFetcher:
 
         if df.empty:
             logger.error(
-                "api.kbars() returned no data for TXF00 (%s → %s). "
+                "api.kbars() returned no data for TXFR1 (%s → %s). "
                 "市場可能休市，或合約在此區間無成交資料。",
                 start, end,
             )
-            raise ValueError(f"No kbar data returned for TXF00 ({start} → {end})")
+            raise ValueError(f"No kbar data returned for TXFR1 ({start} → {end})")
 
         # Apply soft cap (keep the most recent N bars)
         if len(df) > periods:
@@ -226,7 +240,7 @@ class ShioajiDataFetcher:
 
         self._latest_close = float(df["Close"].iloc[-1])
         logger.info(
-            "ShioajiDataFetcher: %d 1-min bars | TXF00 | latest close = %.0f",
+            "ShioajiDataFetcher: %d 1-min bars | TXFR1 | latest close = %.0f",
             len(df), self._latest_close,
         )
 
@@ -433,11 +447,11 @@ def fetch_data(
     end:       "str | None" = None,
 ) -> pd.DataFrame:
     """
-    Top-level convenience function for fetching TXF00 K-line data.
+    Top-level convenience function for fetching TXFR1 K-line data.
 
     Parameters
     ----------
-    symbol    : str   Ignored (always fetches TXF00); kept for API compatibility.
+    symbol    : str   Ignored (always fetches TXFR1); kept for API compatibility.
     timeframe : str   "1min", "5min", "15min", "30min", or "60min".
     periods   : int   Soft cap on 1-min bars before resampling.
     start     : str   Date string "yyyy-mm-dd" (optional).
