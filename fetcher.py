@@ -59,16 +59,41 @@ def _is_in_session(t: dtime) -> bool:
 
 # ---------------------------------------------------------------------------
 # Timeframe → Shioaji Unit mapping
+#
+# Shioaji Unit enum names differ across versions:
+#   1-min  : Unit.Minute  (v1.x)  or Unit.Min1  (older)
+#   60-min : Unit.Hour    (v1.x)  or Unit.Min60 (older)
+# We use getattr with fallback candidates so import never crashes on
+# a version mismatch.  Unsupported timeframes are silently omitted and
+# will raise ValueError at fetch time via the key-missing check.
 # ---------------------------------------------------------------------------
-_UNIT_MAP: "dict[str, sj.constant.Unit]" = {
-    "1min":  sj.constant.Unit.Min1,
-    "5min":  sj.constant.Unit.Min5,
-    "10min": sj.constant.Unit.Min10,
-    "15min": sj.constant.Unit.Min15,
-    "30min": sj.constant.Unit.Min30,
-    "60min": sj.constant.Unit.Min60,
-    "day":   sj.constant.Unit.Day,
-}
+
+def _build_unit_map() -> "dict[str, object]":
+    U = sj.constant.Unit
+    candidates: "dict[str, list[str]]" = {
+        "1min":  ["Minute", "Min1"],
+        "5min":  ["Min5",   "Minute5"],
+        "10min": ["Min10",  "Minute10"],
+        "15min": ["Min15",  "Minute15"],
+        "30min": ["Min30",  "Minute30"],
+        "60min": ["Hour",   "Min60",  "Minute60"],
+        "day":   ["Day",    "Daily"],
+    }
+    result: dict = {}
+    for tf, names in candidates.items():
+        for name in names:
+            unit = getattr(U, name, None)
+            if unit is not None:
+                result[tf] = unit
+                break
+    return result
+
+_UNIT_MAP = _build_unit_map()
+# Log resolved units at import time so mismatches are caught early
+logger.debug(
+    "Shioaji Unit map resolved: %s",
+    {k: v for k, v in _UNIT_MAP.items()},
+)
 
 # Conservative estimate of tradeable minutes per day for TXF
 # (day 300 min + average night tail ~180 min = 480)
