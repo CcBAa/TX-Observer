@@ -4,7 +4,9 @@
       "Bash(python:*)",
       "Bash(python3:*)",
       "Bash(grep:*)",
-      "Bash(source venv/bin/activate)"
+      "Bash(source venv/bin/activate)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

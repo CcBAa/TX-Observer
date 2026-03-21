@@ -22,9 +22,9 @@ Shioaji API 抓取 1-min 原始 K 棒
         ↓
 本地 Resample → 5分K + 60分K
         ↓
-mplfinance 畫圖（含 MA5/10/20/60/240、十字線標記）
+matplotlib GridSpec 單一 Figure（含 MA5/10/20/60/240、十字線標記）
         ↓
-Pillow 垂直拼合 → 單一 PNG（5K 上 / 60K 下）
+匯出單一 PNG（5K 上 56% / 共享 Legend / 60K 下 44%）
         ↓
 上傳 Imgbb 圖床取得公開 URL
         ↓
@@ -51,16 +51,15 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 
 ### 1. 自動 K 線圖（雙週期合圖）
 
-每次觸發輸出一張垂直合圖：
+每次觸發輸出一張單一 Figure 合圖（無需 Pillow 拼合）：
 
 ```
 ┌─────────────────────────────────────┐
-│  [台指期近一]  5K                    │  ← 上圖（60% 高度）
-│  蠟燭圖 + 成交量 + MA5/10/20/60/240  │
-└─────────────────────────────────────┘
-┌─────────────────────────────────────┐
-│  [台指期近一]  60K                   │  ← 下圖（40% 高度）
-│  蠟燭圖 + 成交量 + MA5/10/20/60/240  │
+│  [台指期近一]  5K                    │  ← 上圖（~56% 高度）
+│  蠟燭圖 + MA5/10/20/60/240           │
+├──── MA5 ── MA10 ── MA20 ── MA60 ── MA240 ────┤  ← 共享 Legend
+│  [台指期近一]  60K                   │  ← 下圖（~44% 高度）
+│  蠟燭圖 + MA5/10/20/60/240           │
 └─────────────────────────────────────┘
 ```
 
@@ -71,11 +70,14 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 | 主題 | 暗色系（`nightclouds` 基底，背景 `#0d1117`） |
 | 漲跌色 | **紅漲綠跌**（台灣股市慣例） |
 | 十字線 | 開收盤同價的 Doji K 棒自動標金色 |
-| 中文字體 | 思源黑體繁體中文（`NotoSansCJKtc`）自動偵測或下載 |
-| 解析度 | 150 DPI |
+| 中文字體 | `NotoSansTC-Regular.ttf`，自動偵測系統字體或快取 |
+| 解析度 | 300 DPI |
 | MA 線 | MA5（金）/ MA10（藍）/ MA20（粉）/ MA60（橙）/ MA240（白） |
-| 顯示窗口 | 5K：最新 120 根；60K：最新 80 根 |
+| 共享 Legend | 單一橫向 Legend 列置於兩張子圖之間，不重複顯示 |
+| 顯示窗口 | 5K：最新 90 根；60K：最新 65 根 |
+| 最高/最低標注 | 顯示窗口內最高 High（▲ 紅）與最低 Low（▼ 綠）自動標價 |
 | MA 計算 | 基於**完整資料集**計算後再截取顯示窗口，邊緣值準確 |
+| 渲染架構 | 單一 `matplotlib Figure` + `GridSpec`；mplfinance 外部 axes 模式，無需 Pillow 拼合 |
 
 ### 2. 智慧排程與交易時段過濾
 
@@ -148,7 +150,7 @@ TX-Observer/
 ├── main.py          # 主程式：排程控制、市場行事曆、結算日提醒、任務編排
 ├── config.py        # 配置模組：載入 .env、憑證驗證、Logging 初始化
 ├── fetcher.py       # 資料模組：Shioaji API 單例、Resample、Session 隔離
-├── renderer.py      # 繪圖模組：mplfinance 暗色 K 線圖、Pillow 合圖、CJK 字體
+├── renderer.py      # 繪圖模組：mplfinance 暗色 K 線圖、GridSpec 單一 Figure、CJK 字體
 ├── notifier.py      # 推播模組：Imgbb 上傳 + LINE Messaging API Push
 ├── diagnose.py      # 診斷工具：環境、API 連線、字體等自我檢測
 ├── fonts/           # 自動建立：CJK 字體快取目錄（.gitignore 排除）
@@ -412,9 +414,9 @@ nohup：`kill $(cat tx_observer.pid)`
 | `shioaji` | 永豐金 Shioaji API（台股資料來源） |
 | `pandas-market-calendars` | XTAI 台灣行事曆（假日偵測） |
 | `pandas` / `numpy` | 資料處理與 Resample |
-| `mplfinance` | K 線圖繪製 |
-| `matplotlib` | 圖形後端（Agg，無 GUI） |
-| `Pillow` | 雙圖拼合 |
+| `mplfinance` | K 線圖繪製（外部 axes 模式） |
+| `matplotlib` | 圖形後端（Agg，無 GUI）+ GridSpec 版面 |
+| `Pillow` | 圖像處理（保留於依賴，主渲染流程已改用 GridSpec，不再拼合） |
 | `requests` | Imgbb 上傳 + LINE Push |
 | `APScheduler` | 多 Cron 排程器 |
 | `pytz` | Asia/Taipei 時區處理 |
