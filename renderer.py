@@ -343,20 +343,21 @@ def _render_panel_to_buffer(
             title_kw["fontproperties"] = _FONT_PROPS
         ax_main.set_title(title, **title_kw)
 
-        # ── 均線圖例：右上角，不與置中標題重疊 ──────────────────────────────
-        # mplfinance 將 addplot 線條繪製在 ax_main 上；legend() 只撈有 label 的線。
+        # ── 均線圖例：X 軸下方單行水平橫排，不遮擋 K 線 ───────────────────
+        # bbox_to_anchor=(0.5, -0.15)：Axes 正下方外側置中
+        # ncol=全數量：強制單行排列；frameon=False：移除背景邊框
         ma_handles = [l for l in ax_main.get_lines() if l.get_label().startswith("MA")]
         if ma_handles:
-            legend_kw: dict = dict(
+            leg = ax_main.legend(
                 handles=ma_handles,
-                loc="upper right",
-                fontsize=8,
-                framealpha=0.6,
-                facecolor="#0d1117",
-                edgecolor="#30363d",
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.15),
+                ncol=len(ma_handles),
+                frameon=False,
+                fontsize=9,
+                handlelength=1.5,
+                columnspacing=1.2,
             )
-            leg = ax_main.legend(**legend_kw)
-            # 套用 CJK 字體（圖例標籤為純英文，但保持風格一致）
             for text in leg.get_texts():
                 text.set_color("#e6edf3")
                 if _FONT_PROPS is not None:
