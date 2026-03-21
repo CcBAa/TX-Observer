@@ -154,11 +154,14 @@ _FONT_FAMILY: str = _FONT_PROPS.get_name() if _FONT_PROPS is not None else "sans
 
 # ---------------------------------------------------------------------------
 # Market style — Taiwan convention: red = up (漲), green = down (跌)
+# edge 與 wick 顯式設定，確保高解析度下影線清晰可見（不依賴 inherit 推斷）
 # ---------------------------------------------------------------------------
 _MARKET_COLORS = mpf.make_marketcolors(
     up="red",
     down="green",
-    inherit=True,
+    edge={"up": "red",   "down": "green"},   # K 棒邊框顏色與實體一致
+    wick={"up": "red",   "down": "green"},   # 上下影線顏色與實體一致
+    ohlc="inherit",
 )
 
 _DARK_STYLE = mpf.make_mpf_style(
@@ -188,9 +191,9 @@ _MA_PERIODS = [5,         10,       20,       60,       240     ]
 _MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#FFFFFF"]
 _MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
-# Display window sizes
-_5K_DISPLAY_BARS  = 120   # ~1 full trading day of 5-min bars
-_60K_DISPLAY_BARS = 80    # ~4 trading weeks of hourly bars
+# Display window sizes — 手機高清辨識優先，根數減少讓 K 棒更寬
+_5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K（手機清晰辨識）
+_60K_DISPLAY_BARS = 30    # ~30 根 60 分 K（約 1.5 個交易週）
 
 # Output directory
 DEFAULT_OUTPUT_DIR = Path("charts")
@@ -236,12 +239,13 @@ def render_combined_chart(
     logger.info("Rendering combined chart [%s] 5K+60K...", symbol)
 
     # Render each panel to an in-memory PNG buffer
-    # figsize heights: 5K = 60% of 14", 60K = 40% of 14"
+    # figsize (12, 10): 寬 12" × 高 10"，搭配 dpi=300 輸出 3600×3000 px
+    # 5K 面板略高（更多根數），60K 面板因根數少故略矮但仍清晰
     buf_5k  = _render_panel_to_buffer(
-        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 8.4)
+        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 10)
     )
     buf_60k = _render_panel_to_buffer(
-        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 5.6)
+        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 8)
     )
 
     # Stitch vertically
@@ -318,7 +322,7 @@ def _render_panel_to_buffer(
     plot_kwargs: dict = dict(
         type="candle",
         style=_DARK_STYLE,
-        volume=True,
+        volume=False,           # 不顯示成交量，讓 K 線圖佔滿垂直空間
         figsize=figsize,
         returnfig=True,
         warn_too_much_data=10_000,
@@ -329,19 +333,43 @@ def _render_panel_to_buffer(
 
     try:
         fig, axes = mpf.plot(df_display, **plot_kwargs)
-        _color_doji_candles(axes[0], df_display)
+        ax_main = axes[0]
+        _color_doji_candles(ax_main, df_display)
 
-        # Simplified title: [品種名稱]  5K / 60K
-        # Set on the main K-line axis (axes[0]) with loc='center' so the text
-        # centres over the chart area, not the full figure width.
+        # ── 置中標題：[品種名稱]  5K / 60K ──────────────────────────────────
         title = f"[{symbol}]  {timeframe}"
         title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
         if _FONT_PROPS is not None:
             title_kw["fontproperties"] = _FONT_PROPS
-        axes[0].set_title(title, **title_kw)
+        ax_main.set_title(title, **title_kw)
+
+        # ── 均線圖例：右上角，不與置中標題重疊 ──────────────────────────────
+        # mplfinance 將 addplot 線條繪製在 ax_main 上；legend() 只撈有 label 的線。
+        ma_handles = [l for l in ax_main.get_lines() if l.get_label().startswith("MA")]
+        if ma_handles:
+            legend_kw: dict = dict(
+                handles=ma_handles,
+                loc="upper right",
+                fontsize=8,
+                framealpha=0.6,
+                facecolor="#0d1117",
+                edgecolor="#30363d",
+            )
+            leg = ax_main.legend(**legend_kw)
+            # 套用 CJK 字體（圖例標籤為純英文，但保持風格一致）
+            for text in leg.get_texts():
+                text.set_color("#e6edf3")
+                if _FONT_PROPS is not None:
+                    text.set_fontproperties(_FONT_PROPS)
+
+        # tight_layout：極大化繪圖區域，為頂部標題預留 5% 空間
+        try:
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+        except Exception:
+            pass  # mplfinance 偶爾有 layout 警告，忽略即可
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
         plt.close(fig)
         buf.seek(0)
         return buf
@@ -361,6 +389,7 @@ def _build_ma_addplots(df: pd.DataFrame) -> list:
     """
     Build mplfinance addplot objects for the pre-computed MA columns in *df*.
     Columns that are entirely NaN (insufficient history) are silently skipped.
+    Each addplot carries a label so axes[0].legend() can pick them up later.
     """
     result = []
     for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
@@ -370,7 +399,13 @@ def _build_ma_addplots(df: pd.DataFrame) -> list:
         series = df[col]
         if series.notna().any():
             result.append(
-                mpf.make_addplot(series, color=color, width=width, secondary_y=False)
+                mpf.make_addplot(
+                    series,
+                    color=color,
+                    width=width,
+                    secondary_y=False,
+                    label=f"MA{period}",
+                )
             )
     return result
 
