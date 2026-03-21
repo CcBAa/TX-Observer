@@ -45,11 +45,14 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 _FONT_DIR  = Path(__file__).parent / "fonts"
 _FONT_FILE = _FONT_DIR / "NotoSansTC-Regular.ttf"
 
-# System font paths checked before downloading (Ubuntu / Debian common locations)
+# System font paths checked before downloading (Ubuntu / Debian common locations).
+# TC-specific single-language OTF files are listed BEFORE the combined TTC so
+# Matplotlib gets a clean Traditional-Chinese font instead of defaulting to the
+# JP variant embedded in the TTC collection.
 _SYSTEM_FONT_CANDIDATES = [
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",   # TC-specific ← preferred
     "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",     # combined TTC (JP default) ← last resort
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 ]
 
