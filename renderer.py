@@ -21,21 +21,63 @@ Design notes
 
 import io
 import logging
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # Must be set BEFORE any other matplotlib import
 
-import matplotlib.pyplot as plt  # noqa: E402
-import mplfinance as mpf          # noqa: E402
-import pandas as pd               # noqa: E402
-import pytz                       # noqa: E402
-from PIL import Image             # noqa: E402  (Pillow — stitch panels)
+import matplotlib.font_manager as fm  # noqa: E402
+import matplotlib.pyplot as plt       # noqa: E402
+import mplfinance as mpf              # noqa: E402
+import pandas as pd                   # noqa: E402
+import pytz                           # noqa: E402
+from PIL import Image                 # noqa: E402  (Pillow — stitch panels)
 
 logger = logging.getLogger("tx_observer.renderer")
 
 TW_TZ = pytz.timezone("Asia/Taipei")
+
+
+# ---------------------------------------------------------------------------
+# CJK font — download NotoSansTC-Regular.ttf once and register with Matplotlib
+# ---------------------------------------------------------------------------
+_FONT_DIR  = Path(__file__).parent / "fonts"
+_FONT_FILE = _FONT_DIR / "NotoSansTC-Regular.ttf"
+_FONT_URL  = (
+    "https://github.com/googlefonts/noto-fonts/raw/main/"
+    "hinted/ttf/NotoSansTC/NotoSansTC-Regular.ttf"
+)
+
+
+def _ensure_cjk_font() -> "fm.FontProperties | None":
+    """
+    Ensure NotoSansTC-Regular.ttf is present locally, download if absent.
+    Registers the font with Matplotlib and sets it as the global font family.
+    Returns a FontProperties object, or None if setup failed.
+    """
+    try:
+        _FONT_DIR.mkdir(parents=True, exist_ok=True)
+        if not _FONT_FILE.exists():
+            logger.info("Downloading NotoSansTC-Regular.ttf → %s ...", _FONT_FILE)
+            urllib.request.urlretrieve(_FONT_URL, _FONT_FILE)
+            logger.info("CJK font downloaded successfully.")
+        fm.fontManager.addfont(str(_FONT_FILE))
+        prop = fm.FontProperties(fname=str(_FONT_FILE))
+        matplotlib.rcParams["font.family"] = prop.get_name()
+        logger.info("CJK font registered: %s", prop.get_name())
+        return prop
+    except Exception as exc:
+        logger.warning(
+            "CJK font setup failed (%s) — Chinese titles may render as boxes.", exc
+        )
+        return None
+
+
+_FONT_PROPS: "fm.FontProperties | None" = _ensure_cjk_font()
+_FONT_FAMILY: str = _FONT_PROPS.get_name() if _FONT_PROPS is not None else "sans-serif"
+
 
 # ---------------------------------------------------------------------------
 # Market style — Taiwan convention: red = up (漲), green = down (跌)
@@ -56,6 +98,7 @@ _DARK_STYLE = mpf.make_mpf_style(
     y_on_right=True,
     rc={
         "font.size":        9,
+        "font.family":      _FONT_FAMILY,
         "axes.labelcolor":  "#c9d1d9",
         "axes.edgecolor":   "#30363d",
         "xtick.color":      "#8b949e",
@@ -222,7 +265,6 @@ def _render_panel_to_buffer(
     plot_kwargs: dict = dict(
         type="candle",
         style=_DARK_STYLE,
-        title=title,
         volume=True,
         figsize=figsize,
         returnfig=True,
@@ -235,6 +277,15 @@ def _render_panel_to_buffer(
     try:
         fig, axes = mpf.plot(df_display, **plot_kwargs)
         _color_doji_candles(axes[0], df_display)
+
+        # Apply title with explicit CJK FontProperties so Chinese renders correctly.
+        # We skip mplfinance's built-in title= to avoid font override issues.
+        if _FONT_PROPS is not None:
+            fig.suptitle(title, fontproperties=_FONT_PROPS,
+                         color="#e6edf3", fontsize=10)
+        else:
+            fig.suptitle(title, color="#e6edf3", fontsize=10)
+        fig.subplots_adjust(top=0.88)
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
