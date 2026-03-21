@@ -28,6 +28,7 @@ import matplotlib
 matplotlib.use("Agg")  # Must be set BEFORE any other matplotlib import
 
 import matplotlib.font_manager as fm  # noqa: E402
+import matplotlib.lines as mlines     # noqa: E402
 import matplotlib.pyplot as plt       # noqa: E402
 import mplfinance as mpf              # noqa: E402
 import pandas as pd                   # noqa: E402
@@ -193,7 +194,7 @@ _MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
 # Display window sizes — 手機高清辨識優先，根數減少讓 K 棒更寬
 _5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K（手機清晰辨識）
-_60K_DISPLAY_BARS = 45    # ~45 根 60 分 K（約 2.25 個交易週）
+_60K_DISPLAY_BARS = 65    # ~65 根 60 分 K（約 3.25 個交易週）
 
 # Output directory
 DEFAULT_OUTPUT_DIR = Path("charts")
@@ -240,31 +241,35 @@ def render_combined_chart(
 
     # Render each panel to an in-memory PNG buffer
     # figsize (12, 10): 寬 12" × 高 10"，搭配 dpi=300 輸出 3600×3000 px
-    # 5K 面板略高（更多根數），60K 面板因根數少故略矮但仍清晰
     buf_5k  = _render_panel_to_buffer(
-        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 10)
+        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(18, 10)
     )
     buf_60k = _render_panel_to_buffer(
-        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 8)
+        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(18, 8)
     )
+    # 共用圖例 strip — 放在兩個面板的中間縫隙（模擬 fig.legend 跨面板效果）
+    buf_leg = _render_legend_strip(figwidth=12.0)
 
-    # Stitch vertically
+    # Stitch vertically: 5K ── legend strip ── 60K
     img_5k  = Image.open(buf_5k)
+    img_leg = Image.open(buf_leg)
     img_60k = Image.open(buf_60k)
 
-    # Ensure both panels have the same width
-    if img_5k.width != img_60k.width:
-        img_60k = img_60k.resize(
-            (img_5k.width, img_60k.height), Image.LANCZOS
-        )
+    # Normalise all widths to img_5k.width
+    target_w = img_5k.width
+    if img_leg.width != target_w:
+        img_leg = img_leg.resize((target_w, img_leg.height), Image.LANCZOS)
+    if img_60k.width != target_w:
+        img_60k = img_60k.resize((target_w, img_60k.height), Image.LANCZOS)
 
-    combined = Image.new("RGB", (img_5k.width, img_5k.height + img_60k.height),
-                         color=(13, 17, 23))
+    total_h = img_5k.height + img_leg.height + img_60k.height
+    combined = Image.new("RGB", (target_w, total_h), color=(13, 17, 23))
     combined.paste(img_5k,  (0, 0))
-    combined.paste(img_60k, (0, img_5k.height))
+    combined.paste(img_leg, (0, img_5k.height))
+    combined.paste(img_60k, (0, img_5k.height + img_leg.height))
     combined.save(str(filepath))
 
-    for obj in (buf_5k, buf_60k, img_5k, img_60k, combined):
+    for obj in (buf_5k, buf_leg, buf_60k, img_5k, img_leg, img_60k, combined):
         obj.close()
 
     logger.info("Combined chart saved → %s", filepath)
@@ -343,25 +348,7 @@ def _render_panel_to_buffer(
             title_kw["fontproperties"] = _FONT_PROPS
         ax_main.set_title(title, **title_kw)
 
-        # ── 均線圖例：X 軸下方單行水平橫排，不遮擋 K 線 ───────────────────
-        # bbox_to_anchor=(0.5, -0.15)：Axes 正下方外側置中
-        # ncol=全數量：強制單行排列；frameon=False：移除背景邊框
-        ma_handles = [l for l in ax_main.get_lines() if l.get_label().startswith("MA")]
-        if ma_handles:
-            leg = ax_main.legend(
-                handles=ma_handles,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.15),
-                ncol=len(ma_handles),
-                frameon=False,
-                fontsize=9,
-                handlelength=1.5,
-                columnspacing=1.2,
-            )
-            for text in leg.get_texts():
-                text.set_color("#e6edf3")
-                if _FONT_PROPS is not None:
-                    text.set_fontproperties(_FONT_PROPS)
+        # 圖例已移至共用 legend strip，此面板不另建圖例
 
         # tight_layout：極大化繪圖區域，為頂部標題預留 5% 空間
         try:
@@ -386,11 +373,55 @@ def _render_panel_to_buffer(
         ) from exc
 
 
+def _build_legend_handles() -> list:
+    """
+    Build proxy Line2D handles for the shared MA legend.
+    Uses constants directly — no plot object needed.
+    """
+    return [
+        mlines.Line2D([], [], color=color, linewidth=width, label=f"MA{period}")
+        for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS)
+    ]
+
+
+def _render_legend_strip(figwidth: float = 12.0) -> io.BytesIO:
+    """
+    Render a single-row MA legend as a minimal-height PNG strip.
+
+    This strip is stitched between the 5K and 60K panels by
+    render_combined_chart(), giving the visual effect of a shared
+    figure-level legend placed in the gap between the two sub-charts.
+    Height is kept to ~0.45" so the gap stays tight.
+    """
+    handles = _build_legend_handles()
+    fig = plt.figure(figsize=(figwidth, 0.45), facecolor="#0d1117")
+    leg = fig.legend(
+        handles=handles,
+        loc="center",
+        ncol=len(handles),
+        frameon=False,
+        fontsize=9,
+        handlelength=1.5,
+        columnspacing=1.4,
+    )
+    for text in leg.get_texts():
+        text.set_color("#e6edf3")
+        if _FONT_PROPS is not None:
+            text.set_fontproperties(_FONT_PROPS)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
+                facecolor="#0d1117")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def _build_ma_addplots(df: pd.DataFrame) -> list:
     """
     Build mplfinance addplot objects for the pre-computed MA columns in *df*.
     Columns that are entirely NaN (insufficient history) are silently skipped.
-    Each addplot carries a label so axes[0].legend() can pick them up later.
+    Each addplot carries a label for identification (legend uses proxy handles).
     """
     result = []
     for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
