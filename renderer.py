@@ -184,9 +184,9 @@ _DARK_STYLE = mpf.make_mpf_style(
 # ---------------------------------------------------------------------------
 # MA configuration — periods 5, 10, 20, 60 (Taiwan standard)
 # ---------------------------------------------------------------------------
-_MA_PERIODS = [5,         10,       20,       60      ]
-_MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500"]
-_MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2     ]
+_MA_PERIODS = [5,         10,       20,       60,       240     ]
+_MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#FFFFFF"]
+_MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
 # Display window sizes
 _5K_DISPLAY_BARS  = 120   # ~1 full trading day of 5-min bars
@@ -325,14 +325,14 @@ def _render_panel_to_buffer(
         title = (
             f"[{symbol}]  5K  ·  Last: {latest:,.0f}  "
             f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
-            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙)  "
+            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙) · 240(白)  "
             f"·  {now.strftime('%Y-%m-%d %H:%M')} UTC+8"
         )
     else:
         title = (
             f"[{symbol}]  60K  ·  Last: {latest:,.0f}  "
             f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
-            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙)"
+            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙) · 240(白)"
         )
 
     plot_kwargs: dict = dict(

@@ -54,8 +54,8 @@ from renderer import render_combined_chart           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-_BARS_5K  = 200   # 1-min → 5K: need extra history for MA60
-_BARS_60K = 100   # 1-min → 60K: ~5 trading days
+_BARS_5K  = 400   # 1-min → 5K: 240 (MA240) + 120 (display) + buffer
+_BARS_60K = 350   # 1-min → 60K: 240 (MA240) + 80 (display) + buffer
 
 # Symbols dispatched in each job
 _FUTURES_SYMBOLS: list[tuple[str, str]] = [
