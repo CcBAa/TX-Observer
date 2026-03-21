@@ -21,7 +21,6 @@ Design notes
 
 import io
 import logging
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -41,38 +40,109 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 
 
 # ---------------------------------------------------------------------------
-# CJK font — download NotoSansTC-Regular.ttf once and register with Matplotlib
+# CJK font — locate / download NotoSansTC and register with Matplotlib
 # ---------------------------------------------------------------------------
 _FONT_DIR  = Path(__file__).parent / "fonts"
 _FONT_FILE = _FONT_DIR / "NotoSansTC-Regular.ttf"
-_FONT_URL  = (
-    "https://github.com/googlefonts/noto-fonts/raw/main/"
-    "hinted/ttf/NotoSansTC/NotoSansTC-Regular.ttf"
-)
+
+# System font paths checked before downloading (Ubuntu / Debian common locations)
+_SYSTEM_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+]
+
+# Magic bytes that identify a real font file (TTF / OTF / TTC)
+_FONT_MAGIC = {b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf"}
+
+
+def _is_valid_font(path: Path) -> bool:
+    """Return True if *path* starts with a known font-file magic number."""
+    try:
+        with path.open("rb") as f:
+            return f.read(4) in _FONT_MAGIC
+    except OSError:
+        return False
+
+
+def _register(path: Path) -> "fm.FontProperties":
+    """Register *path* with Matplotlib and return a FontProperties object."""
+    fm.fontManager.addfont(str(path))
+    prop = fm.FontProperties(fname=str(path))
+    matplotlib.rcParams["font.family"] = prop.get_name()
+    return prop
+
+
+def _find_via_fc_list() -> "Path | None":
+    """
+    Use fc-list to dynamically locate a CJK-capable font installed on the system.
+    Tries Traditional Chinese first, then generic Chinese, then Japanese (also CJK).
+    """
+    import subprocess
+    for lang in ("zh-tw", "zh-hant", "zh", "ja"):
+        try:
+            out = subprocess.run(
+                ["fc-list", f":lang={lang}", "--format=%{file}\n"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            for line in out.splitlines():
+                p = Path(line.strip())
+                if p.exists() and _is_valid_font(p):
+                    return p
+        except Exception:
+            return None   # fc-list not available
+    return None
 
 
 def _ensure_cjk_font() -> "fm.FontProperties | None":
     """
-    Ensure NotoSansTC-Regular.ttf is present locally, download if absent.
-    Registers the font with Matplotlib and sets it as the global font family.
-    Returns a FontProperties object, or None if setup failed.
+    Locate a CJK-capable font and register it with Matplotlib.
+
+    Search order:
+      1. Local cached file (fonts/NotoSansTC-Regular.ttf) — magic-byte validated.
+         Corrupt files (e.g. a previously saved HTML 404 page) are deleted.
+      2. fc-list — dynamically queries fontconfig for installed CJK fonts.
+      3. Static fallback paths for Ubuntu / Debian Noto CJK packages.
+
+    If all sources fail the log shows the exact apt-get command to fix it.
     """
-    try:
-        _FONT_DIR.mkdir(parents=True, exist_ok=True)
-        if not _FONT_FILE.exists():
-            logger.info("Downloading NotoSansTC-Regular.ttf → %s ...", _FONT_FILE)
-            urllib.request.urlretrieve(_FONT_URL, _FONT_FILE)
-            logger.info("CJK font downloaded successfully.")
-        fm.fontManager.addfont(str(_FONT_FILE))
-        prop = fm.FontProperties(fname=str(_FONT_FILE))
-        matplotlib.rcParams["font.family"] = prop.get_name()
-        logger.info("CJK font registered: %s", prop.get_name())
-        return prop
-    except Exception as exc:
+    # 1. Local cache (user-placed or previously downloaded valid file)
+    if _FONT_FILE.exists():
+        if _is_valid_font(_FONT_FILE):
+            prop = _register(_FONT_FILE)
+            logger.info("CJK font loaded from cache: %s  →  family '%s'",
+                        _FONT_FILE.name, prop.get_name())
+            return prop
         logger.warning(
-            "CJK font setup failed (%s) — Chinese titles may render as boxes.", exc
+            "Cached font file %s is not a valid font (possibly a corrupt download). "
+            "Deleting it.", _FONT_FILE
         )
-        return None
+        _FONT_FILE.unlink()
+
+    # 2. fc-list — works automatically after `apt-get install fonts-noto-cjk`
+    fc_path = _find_via_fc_list()
+    if fc_path is not None:
+        prop = _register(fc_path)
+        logger.info("CJK font found via fc-list: %s  →  family '%s'",
+                    fc_path, prop.get_name())
+        return prop
+
+    # 3. Static system paths (belt-and-suspenders for known Ubuntu locations)
+    for sys_path_str in _SYSTEM_FONT_CANDIDATES:
+        sys_path = Path(sys_path_str)
+        if sys_path.exists() and _is_valid_font(sys_path):
+            prop = _register(sys_path)
+            logger.info("CJK font found at static path: %s  →  family '%s'",
+                        sys_path, prop.get_name())
+            return prop
+
+    logger.warning(
+        "No CJK font found — Chinese characters will appear as boxes.\n"
+        "  Fix: sudo apt-get install -y fonts-noto-cjk\n"
+        "       then restart TX-Observer."
+    )
+    return None
 
 
 _FONT_PROPS: "fm.FontProperties | None" = _ensure_cjk_font()
