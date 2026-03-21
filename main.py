@@ -40,6 +40,12 @@ import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+try:
+    import pandas_market_calendars as mcal
+    _HAS_MCAL = True
+except ImportError:
+    _HAS_MCAL = False
+
 from config import get_credentials, setup_logging
 
 logger = setup_logging()
@@ -65,6 +71,11 @@ _SPOT_SYMBOLS: list[tuple[str, str]] = [
     ("TSE/001", "加權指數"),
     ("OTC/101", "櫃買指數"),
 ]
+
+# ---------------------------------------------------------------------------
+# Market state — updated at startup and daily at 08:30 by run_market_check()
+# ---------------------------------------------------------------------------
+_market_open_today: bool = True   # default True; corrected before scheduler starts
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +122,83 @@ def is_trading_time(dt: datetime, market: str = "futures") -> bool:
     if _DAY_END < t < _NIGHT_START:        # 13:45–15:00 lunch break / gap
         return False
     return True                            # 15:00+ night session
+
+
+# ---------------------------------------------------------------------------
+# Market calendar — is today a Taiwan trading day?
+# ---------------------------------------------------------------------------
+
+def is_market_open_today(dt: datetime) -> bool:
+    """
+    Return True if *dt* (UTC+8) falls on a Taiwan Stock Exchange trading day.
+
+    Uses pandas_market_calendars XTAI calendar when available; this correctly
+    handles public holidays, Chinese New Year closures, and Saturday make-up
+    sessions.  Falls back to a simple Mon–Fri weekday check when the library
+    is not installed (with a one-time warning logged).
+    """
+    if not _HAS_MCAL:
+        logger.warning(
+            "pandas_market_calendars not installed — holiday detection disabled. "
+            "Install with:  pip install pandas-market-calendars"
+        )
+        return dt.weekday() < 5   # Mon–Fri only
+
+    try:
+        cal       = mcal.get_calendar("XTAI")
+        date_str  = dt.strftime("%Y-%m-%d")
+        schedule  = cal.schedule(start_date=date_str, end_date=date_str)
+        return not schedule.empty
+    except Exception as exc:
+        logger.warning("Market calendar check failed (%s) — assuming open.", exc)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Settlement day — third Wednesday of each month (台指期月結算)
+# ---------------------------------------------------------------------------
+
+def is_settlement_day(dt: datetime) -> bool:
+    """
+    Return True if *dt* is the third Wednesday of its month.
+
+    The third Wednesday always falls between the 15th and 21st (inclusive).
+    This is a closed-form check that handles all months without iteration.
+
+    Examples
+    --------
+    2026-03-18 (Wed, day 18)  →  True   (3rd Wed of March 2026)
+    2026-03-11 (Wed, day 11)  →  False  (2nd Wed)
+    2026-03-18 (Thu)          →  False  (not a Wednesday)
+    """
+    return dt.weekday() == 2 and 15 <= dt.day <= 21
+
+
+# ---------------------------------------------------------------------------
+# Daily market check — runs at 08:30 and once at startup
+# ---------------------------------------------------------------------------
+
+def run_market_check() -> None:
+    """
+    Refresh *_market_open_today* for the current date.
+
+    Scheduled daily at 08:30 (Asia/Taipei) so the flag is set before the
+    first trading job fires at 08:45.  Also called once during startup so
+    the flag is correct even if the process starts after 08:30.
+    """
+    global _market_open_today
+    now = datetime.now(tz=TW_TZ)
+    _market_open_today = is_market_open_today(now)
+    if _market_open_today:
+        logger.info(
+            "今日台股開盤（%s），排程任務正常執行。",
+            now.strftime("%Y-%m-%d %A"),
+        )
+    else:
+        logger.info(
+            "今日為台股休市日（%s），系統進入休眠模式。",
+            now.strftime("%Y-%m-%d %A"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +250,15 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
         pct    = (chg / prev * 100.0) if prev else 0.0
         arrow  = "▲" if chg >= 0 else "▼"
 
+        # Settlement day prefix — TXFR1 only, third Wednesday of each month
+        settlement_prefix = ""
+        if symbol == "TXFR1" and is_settlement_day(now):
+            settlement_prefix = "【今日台指結算日】\n"
+            logger.info("[%s] 今日為台指期結算日。", display_name)
+
         push_text = (
-            f"[TX-Observer]  {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
+            settlement_prefix
+            + f"[TX-Observer]  {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
             f"{display_name} ({symbol})\n"
             f"Last:    {latest:>10,.0f}\n"
             f"Change:  {arrow} {abs(chg):.0f}  ({pct:+.2f}%)\n"
@@ -209,6 +304,9 @@ def run_futures_job() -> None:
               15:00–23:00 every hour (night early)
               00:00–05:00 every hour (night late)
     """
+    if not _market_open_today:
+        return   # already logged in run_market_check()
+
     now = datetime.now(tz=TW_TZ)
     if not is_trading_time(now, market="futures"):
         logger.info(
@@ -234,6 +332,9 @@ def run_spot_job() -> None:
 
     Error isolation: if one index fails, the other still runs.
     """
+    if not _market_open_today:
+        return   # already logged in run_market_check()
+
     now = datetime.now(tz=TW_TZ)
     if not is_trading_time(now, market="spot"):
         logger.info(
@@ -337,6 +438,24 @@ def build_scheduler() -> BlockingScheduler:
         name="Spot Indices Day Session (09:00–13:00)",
     )
 
+    # E. Daily market-open check (08:30) — must fire before 08:45 futures job.
+    #    mon-sat covers Saturday make-up sessions where the market reopens.
+    #    misfire_grace_time=300 s so the check still runs after a brief VM resume.
+    scheduler.add_job(
+        func=run_market_check,
+        trigger=CronTrigger(
+            day_of_week="mon-sat",
+            hour=8,
+            minute=30,
+            second=0,
+            timezone=TW_TZ,
+        ),
+        id="market_check",
+        name="Daily Market Open Check (08:30)",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+
     return scheduler
 
 
@@ -392,6 +511,10 @@ def main() -> None:
     except Exception as exc:
         logger.error("Shioaji initialization failed: %s", exc)
         sys.exit(1)
+
+    # Initialise the market-open flag immediately so the correct state is known
+    # before the scheduler's first 08:30 check fires.
+    run_market_check()
 
     if args.run_now:
         logger.info("--run-now: executing jobs immediately (trading-hours gate bypassed)...")

@@ -1,26 +1,30 @@
 # TX-Observer | Python dependencies
 # Install: pip install -r requirements.txt
+# Tested on Python 3.10 (Ubuntu 22.04, Oracle Cloud)
 
-# Environment / configuration
+# ── Environment / secrets ──────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 
-# Market data — 永豐金 Shioaji API
+# ── Market data — 永豐金 Shioaji API ──────────────────────────────────────────
 shioaji>=1.1.0
 
-# Data handling
+# ── Market calendar — Taiwan Stock Exchange holiday detection ──────────────────
+pandas-market-calendars>=4.1.4
+
+# ── Data handling ──────────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Chart rendering (headless — no GUI required)
+# ── Chart rendering (headless — no GUI required) ───────────────────────────────
 mplfinance>=0.12.10b0
 matplotlib>=3.7.3
 Pillow>=10.0.0          # PIL — stitch dual-panel combined charts
 
-# HTTP client — Imgbb upload + LINE Messaging API push
+# ── HTTP client — Imgbb upload + LINE Messaging API push ──────────────────────
 requests>=2.28.0
 
-# Scheduler
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 APScheduler>=3.10.0
 
-# Timezone support
+# ── Timezone support ──────────────────────────────────────────────────────────
 pytz>=2023.3

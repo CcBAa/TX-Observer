@@ -4,12 +4,16 @@
 
 # ── Secrets & credentials (NEVER commit) ─────────────────────────────────────
 .env
+# .env.example is intentionally NOT excluded — it contains only placeholders
 
 # ── Generated chart images ────────────────────────────────────────────────────
 charts/
 *.png
 *.jpg
 *.jpeg
+
+# ── Downloaded CJK fonts cache ────────────────────────────────────────────────
+fonts/
 
 # ── Log files ─────────────────────────────────────────────────────────────────
 *.log
