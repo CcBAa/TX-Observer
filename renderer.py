@@ -238,10 +238,10 @@ def render_combined_chart(
     # Render each panel to an in-memory PNG buffer
     # figsize heights: 5K = 60% of 14", 60K = 40% of 14"
     buf_5k  = _render_panel_to_buffer(
-        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 8.4), now=now_tw
+        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(12, 8.4)
     )
     buf_60k = _render_panel_to_buffer(
-        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 5.6), now=now_tw
+        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(12, 5.6)
     )
 
     # Stitch vertically
@@ -277,13 +277,15 @@ def _render_panel_to_buffer(
     timeframe:    str,
     display_bars: int,
     figsize:      "tuple[float, float]",
-    now:          datetime,
 ) -> io.BytesIO:
     """
     Render a single candlestick panel to a BytesIO PNG buffer.
 
     MAs are computed on the FULL dataset for accuracy, then the view
     is sliced to *display_bars* before plotting.
+
+    Title is set via axes[0].set_title(loc='center') so it aligns with
+    the K-line chart area rather than the full figure width.
     """
     df_plot = _prepare_dataframe(df)
     df_plot = df_plot.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
@@ -297,13 +299,6 @@ def _render_panel_to_buffer(
     # Compute MAs on the full dataset BEFORE slicing
     for period in _MA_PERIODS:
         df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
-
-    # Price summary from the most recent bar (full dataset)
-    latest = float(df_plot["Close"].iloc[-1])
-    prev   = float(df_plot["Close"].iloc[-2]) if len(df_plot) > 1 else latest
-    chg    = latest - prev
-    pct    = (chg / prev * 100.0) if prev else 0.0
-    arrow  = "▲" if chg >= 0 else "▼"
 
     # Slice to display window
     df_display = df_plot.iloc[-display_bars:].copy()
@@ -319,21 +314,6 @@ def _render_panel_to_buffer(
     # Strip MA columns — mpf.plot() expects pure OHLCV
     ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
     df_display = df_display[ohlcv_cols]
-
-    # Build title
-    if timeframe == "5K":
-        title = (
-            f"[{symbol}]  5K  ·  Last: {latest:,.0f}  "
-            f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
-            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙) · 240(白)  "
-            f"·  {now.strftime('%Y-%m-%d %H:%M')} UTC+8"
-        )
-    else:
-        title = (
-            f"[{symbol}]  60K  ·  Last: {latest:,.0f}  "
-            f"{arrow}{abs(chg):.0f} ({pct:+.2f}%)\n"
-            f"MA: 5(金) · 10(藍) · 20(粉) · 60(橙) · 240(白)"
-        )
 
     plot_kwargs: dict = dict(
         type="candle",
@@ -351,14 +331,14 @@ def _render_panel_to_buffer(
         fig, axes = mpf.plot(df_display, **plot_kwargs)
         _color_doji_candles(axes[0], df_display)
 
-        # Apply title with explicit CJK FontProperties so Chinese renders correctly.
-        # We skip mplfinance's built-in title= to avoid font override issues.
+        # Simplified title: [品種名稱]  5K / 60K
+        # Set on the main K-line axis (axes[0]) with loc='center' so the text
+        # centres over the chart area, not the full figure width.
+        title = f"[{symbol}]  {timeframe}"
+        title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
         if _FONT_PROPS is not None:
-            fig.suptitle(title, fontproperties=_FONT_PROPS,
-                         color="#e6edf3", fontsize=10)
-        else:
-            fig.suptitle(title, color="#e6edf3", fontsize=10)
-        fig.subplots_adjust(top=0.88)
+            title_kw["fontproperties"] = _FONT_PROPS
+        axes[0].set_title(title, **title_kw)
 
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
