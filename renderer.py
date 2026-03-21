@@ -193,7 +193,7 @@ _MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
 # Display window sizes — 手機高清辨識優先，根數減少讓 K 棒更寬
 _5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K（手機清晰辨識）
-_60K_DISPLAY_BARS = 30    # ~30 根 60 分 K（約 1.5 個交易週）
+_60K_DISPLAY_BARS = 45    # ~45 根 60 分 K（約 2.25 個交易週）
 
 # Output directory
 DEFAULT_OUTPUT_DIR = Path("charts")
