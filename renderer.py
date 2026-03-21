@@ -5,8 +5,9 @@ Public API
 ----------
 render_combined_chart(df_5k, df_60k, symbol, output_dir) → Path
     Renders 5K and 60K charts into a single combined PNG image:
-      - Upper panel (60% height): 5K candlestick + MA lines
-      - Lower panel (40% height): 60K candlestick + MA lines
+      - Upper panel (~56% height): 5K candlestick + MA lines
+      - Shared legend row: single horizontal MA legend strip between panels
+      - Lower panel (~44% height): 60K candlestick + MA lines
 
 Design notes
 ------------
@@ -14,12 +15,14 @@ Design notes
 - Taiwan colour convention: red = up (漲), green = down (跌)
 - MA lines pre-computed on the FULL dataset so tail values are accurate
   after slicing to the display window
-- Two panels are rendered independently by mplfinance (returnfig=True)
-  then stitched vertically with Pillow — this avoids mplfinance external-axes
-  compatibility quirks and produces identical styling for both panels
+- Single matplotlib Figure with 2 GridSpec subplots; mplfinance plots
+  candles via ax= external-axes mode; MA lines are overlaid manually
+  with ax.plot() at integer x-coordinates (aligned to mplfinance's
+  internal show_nontrading=False x-axis)
+- One shared fig.legend() placed in the hspace gap between panels —
+  no per-panel legend, no Pillow stitching required
 """
 
-import io
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +36,6 @@ import matplotlib.pyplot as plt       # noqa: E402
 import mplfinance as mpf              # noqa: E402
 import pandas as pd                   # noqa: E402
 import pytz                           # noqa: E402
-from PIL import Image                 # noqa: E402  (Pillow — stitch panels)
 
 logger = logging.getLogger("tx_observer.renderer")
 
@@ -41,28 +43,22 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 
 
 # ---------------------------------------------------------------------------
-# CJK font — locate / download NotoSansTC and register with Matplotlib
+# CJK font — locate NotoSansTC and register with Matplotlib
 # ---------------------------------------------------------------------------
 _FONT_DIR  = Path(__file__).parent / "fonts"
 _FONT_FILE = _FONT_DIR / "NotoSansTC-Regular.ttf"
 
-# System font paths checked before downloading (Ubuntu / Debian common locations).
-# TC-specific single-language OTF files are listed BEFORE the combined TTC so
-# Matplotlib gets a clean Traditional-Chinese font instead of defaulting to the
-# JP variant embedded in the TTC collection.
 _SYSTEM_FONT_CANDIDATES = [
-    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",   # TC-specific ← preferred
+    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
     "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.ttf",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",     # combined TTC (JP default) ← last resort
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 ]
 
-# Magic bytes that identify a real font file (TTF / OTF / TTC)
 _FONT_MAGIC = {b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf"}
 
 
 def _is_valid_font(path: Path) -> bool:
-    """Return True if *path* starts with a known font-file magic number."""
     try:
         with path.open("rb") as f:
             return f.read(4) in _FONT_MAGIC
@@ -71,7 +67,6 @@ def _is_valid_font(path: Path) -> bool:
 
 
 def _register(path: Path) -> "fm.FontProperties":
-    """Register *path* with Matplotlib and return a FontProperties object."""
     fm.fontManager.addfont(str(path))
     prop = fm.FontProperties(fname=str(path))
     matplotlib.rcParams["font.family"] = prop.get_name()
@@ -79,10 +74,6 @@ def _register(path: Path) -> "fm.FontProperties":
 
 
 def _find_via_fc_list() -> "Path | None":
-    """
-    Use fc-list to dynamically locate a CJK-capable font installed on the system.
-    Tries Traditional Chinese first, then generic Chinese, then Japanese (also CJK).
-    """
     import subprocess
     for lang in ("zh-tw", "zh-hant", "zh", "ja"):
         try:
@@ -95,56 +86,37 @@ def _find_via_fc_list() -> "Path | None":
                 if p.exists() and _is_valid_font(p):
                     return p
         except Exception:
-            return None   # fc-list not available
+            return None
     return None
 
 
 def _ensure_cjk_font() -> "fm.FontProperties | None":
-    """
-    Locate a CJK-capable font and register it with Matplotlib.
-
-    Search order:
-      1. Local cached file (fonts/NotoSansTC-Regular.ttf) — magic-byte validated.
-         Corrupt files (e.g. a previously saved HTML 404 page) are deleted.
-      2. fc-list — dynamically queries fontconfig for installed CJK fonts.
-      3. Static fallback paths for Ubuntu / Debian Noto CJK packages.
-
-    If all sources fail the log shows the exact apt-get command to fix it.
-    """
-    # 1. Local cache (user-placed or previously downloaded valid file)
     if _FONT_FILE.exists():
         if _is_valid_font(_FONT_FILE):
             prop = _register(_FONT_FILE)
             logger.info("CJK font loaded from cache: %s  →  family '%s'",
                         _FONT_FILE.name, prop.get_name())
             return prop
-        logger.warning(
-            "Cached font file %s is not a valid font (possibly a corrupt download). "
-            "Deleting it.", _FONT_FILE
-        )
+        logger.warning("Cached font %s is corrupt — deleting.", _FONT_FILE)
         _FONT_FILE.unlink()
 
-    # 2. fc-list — works automatically after `apt-get install fonts-noto-cjk`
     fc_path = _find_via_fc_list()
     if fc_path is not None:
         prop = _register(fc_path)
-        logger.info("CJK font found via fc-list: %s  →  family '%s'",
-                    fc_path, prop.get_name())
+        logger.info("CJK font via fc-list: %s  →  '%s'", fc_path, prop.get_name())
         return prop
 
-    # 3. Static system paths (belt-and-suspenders for known Ubuntu locations)
     for sys_path_str in _SYSTEM_FONT_CANDIDATES:
         sys_path = Path(sys_path_str)
         if sys_path.exists() and _is_valid_font(sys_path):
             prop = _register(sys_path)
-            logger.info("CJK font found at static path: %s  →  family '%s'",
+            logger.info("CJK font at static path: %s  →  '%s'",
                         sys_path, prop.get_name())
             return prop
 
     logger.warning(
         "No CJK font found — Chinese characters will appear as boxes.\n"
-        "  Fix: sudo apt-get install -y fonts-noto-cjk\n"
-        "       then restart TX-Observer."
+        "  Fix: sudo apt-get install -y fonts-noto-cjk"
     )
     return None
 
@@ -155,13 +127,13 @@ _FONT_FAMILY: str = _FONT_PROPS.get_name() if _FONT_PROPS is not None else "sans
 
 # ---------------------------------------------------------------------------
 # Market style — Taiwan convention: red = up (漲), green = down (跌)
-# edge 與 wick 顯式設定，確保高解析度下影線清晰可見（不依賴 inherit 推斷）
+# edge 與 wick 顯式設定，確保高解析度下影線清晰可見
 # ---------------------------------------------------------------------------
 _MARKET_COLORS = mpf.make_marketcolors(
     up="red",
     down="green",
-    edge={"up": "red",   "down": "green"},   # K 棒邊框顏色與實體一致
-    wick={"up": "red",   "down": "green"},   # 上下影線顏色與實體一致
+    edge={"up": "red",   "down": "green"},
+    wick={"up": "red",   "down": "green"},
     ohlc="inherit",
 )
 
@@ -186,17 +158,16 @@ _DARK_STYLE = mpf.make_mpf_style(
 )
 
 # ---------------------------------------------------------------------------
-# MA configuration — periods 5, 10, 20, 60 (Taiwan standard)
+# MA configuration — periods 5, 10, 20, 60, 240 (Taiwan standard)
 # ---------------------------------------------------------------------------
 _MA_PERIODS = [5,         10,       20,       60,       240     ]
 _MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#FFFFFF"]
 _MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
-# Display window sizes — 手機高清辨識優先，根數減少讓 K 棒更寬
-_5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K（手機清晰辨識）
+# Display window sizes
+_5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K
 _60K_DISPLAY_BARS = 65    # ~65 根 60 分 K（約 3.25 個交易週）
 
-# Output directory
 DEFAULT_OUTPUT_DIR = Path("charts")
 
 
@@ -215,15 +186,17 @@ def render_combined_chart(
 
     Layout
     ------
-    Upper panel (60% of total height): 5K candles + volume + MA(5,10,20,60)
-    Lower panel (40% of total height): 60K candles + volume + MA(5,10,20,60)
+    Single matplotlib Figure with 2 GridSpec rows:
+      Row 0 (height 10): 5K candles + MA overlays
+      Row 1 (height  8): 60K candles + MA overlays
+      hspace gap between rows hosts the shared fig.legend()
 
     Parameters
     ----------
-    df_5k      : OHLCV DataFrame at 5-min resolution (from fetcher).
-    df_60k     : OHLCV DataFrame at 60-min resolution (from fetcher).
-    symbol     : Display name shown in chart titles, e.g. "台指期近一".
-    output_dir : Directory for the output PNG. Created if absent.
+    df_5k      : OHLCV DataFrame at 5-min resolution.
+    df_60k     : OHLCV DataFrame at 60-min resolution.
+    symbol     : Display name, e.g. "台指期近一".
+    output_dir : Output directory. Created if absent.
 
     Returns
     -------
@@ -239,38 +212,84 @@ def render_combined_chart(
 
     logger.info("Rendering combined chart [%s] 5K+60K...", symbol)
 
-    # Render each panel to an in-memory PNG buffer
-    # figsize (12, 10): 寬 12" × 高 10"，搭配 dpi=300 輸出 3600×3000 px
-    buf_5k  = _render_panel_to_buffer(
-        df_5k,  symbol, "5K",  _5K_DISPLAY_BARS,  figsize=(18, 10)
+    # ── Data preparation ────────────────────────────────────────────────────
+    df_5k_d  = _prepare_and_slice(df_5k,  symbol, "5K",  _5K_DISPLAY_BARS)
+    df_60k_d = _prepare_and_slice(df_60k, symbol, "60K", _60K_DISPLAY_BARS)
+
+    ohlcv = ["Open", "High", "Low", "Close", "Volume"]
+
+    # ── Single figure, 2 subplots ───────────────────────────────────────────
+    # figsize=(16, 12)：寬幅比例，讓 K 棒間距充足
+    # hspace=0.50：留出足夠縫隙放中間橫排圖例，不擋 60K 標題
+    fig = plt.figure(figsize=(16, 12), facecolor="#0d1117")
+    gs  = fig.add_gridspec(2, 1, height_ratios=[10, 8], hspace=0.50)
+    ax_5k  = fig.add_subplot(gs[0])
+    ax_60k = fig.add_subplot(gs[1])
+
+    # ── Candlestick via mplfinance (external-axes mode) ─────────────────────
+    # volume=False：讓 K 線圖佔滿整個 Axes
+    # show_nontrading=False：跳過非交易時段，x 座標為連續整數
+    _mpf_kwargs = dict(
+        type="candle",
+        style=_DARK_STYLE,
+        volume=False,
+        warn_too_much_data=10_000,
+        show_nontrading=False,
     )
-    buf_60k = _render_panel_to_buffer(
-        df_60k, symbol, "60K", _60K_DISPLAY_BARS, figsize=(18, 8)
+    mpf.plot(df_5k_d[ohlcv],  ax=ax_5k,  **_mpf_kwargs)
+    mpf.plot(df_60k_d[ohlcv], ax=ax_60k, **_mpf_kwargs)
+
+    # ── X 軸時間刻度 ────────────────────────────────────────────────────────
+    # 5K：每 60 分鐘一格；60K：每 10 小時（600 分鐘）一格
+    _set_time_ticks(ax_5k,  df_5k_d,  interval_minutes=60)
+    _set_time_ticks(ax_60k, df_60k_d, interval_minutes=600)
+
+    # ── MA lines — overlaid manually at integer x-positions ─────────────────
+    # mplfinance (show_nontrading=False) places bar i at x=i,
+    # so range(len(df)) aligns exactly with each candle centre.
+    for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
+        col = f"MA{period}"
+        for ax, df_d in ((ax_5k, df_5k_d), (ax_60k, df_60k_d)):
+            s = df_d[col]
+            if s.notna().any():
+                ax.plot(
+                    range(len(df_d)), s.values,
+                    color=color, linewidth=width,
+                    zorder=3, solid_capstyle="round",
+                )
+
+    # ── Doji highlighting ───────────────────────────────────────────────────
+    _color_doji_candles(ax_5k,  df_5k_d)
+    _color_doji_candles(ax_60k, df_60k_d)
+
+    # ── Titles (置中，使用 NotoSansTC) ──────────────────────────────────────
+    title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
+    if _FONT_PROPS is not None:
+        title_kw["fontproperties"] = _FONT_PROPS
+    ax_5k.set_title(f"[{symbol}]  5K",  **title_kw)
+    ax_60k.set_title(f"[{symbol}]  60K", **title_kw)
+
+    # ── Global legend — 單行水平，放在兩圖之間的縫隙 ────────────────────────
+    # height_ratios=[10, 8]，hspace=0.50 → 縫隙幾何中心約在 Figure y ≈ 0.495
+    handles = _build_legend_handles()
+    leg = fig.legend(
+        handles=handles,
+        ncol=len(handles),
+        loc="center",
+        bbox_to_anchor=(0.5, 0.495),   # 兩圖縫隙的幾何中心
+        frameon=False,
+        fontsize=9,
+        handlelength=1.5,
+        columnspacing=1.2,
     )
-    # 共用圖例 strip — 放在兩個面板的中間縫隙（模擬 fig.legend 跨面板效果）
-    buf_leg = _render_legend_strip(figwidth=12.0)
+    for text in leg.get_texts():
+        text.set_color("#e6edf3")
+        if _FONT_PROPS is not None:
+            text.set_fontproperties(_FONT_PROPS)
 
-    # Stitch vertically: 5K ── legend strip ── 60K
-    img_5k  = Image.open(buf_5k)
-    img_leg = Image.open(buf_leg)
-    img_60k = Image.open(buf_60k)
-
-    # Normalise all widths to img_5k.width
-    target_w = img_5k.width
-    if img_leg.width != target_w:
-        img_leg = img_leg.resize((target_w, img_leg.height), Image.LANCZOS)
-    if img_60k.width != target_w:
-        img_60k = img_60k.resize((target_w, img_60k.height), Image.LANCZOS)
-
-    total_h = img_5k.height + img_leg.height + img_60k.height
-    combined = Image.new("RGB", (target_w, total_h), color=(13, 17, 23))
-    combined.paste(img_5k,  (0, 0))
-    combined.paste(img_leg, (0, img_5k.height))
-    combined.paste(img_60k, (0, img_5k.height + img_leg.height))
-    combined.save(str(filepath))
-
-    for obj in (buf_5k, buf_leg, buf_60k, img_5k, img_leg, img_60k, combined):
-        obj.close()
+    # ── Save ────────────────────────────────────────────────────────────────
+    fig.savefig(str(filepath), dpi=300, bbox_inches="tight", facecolor="#0d1117")
+    plt.close(fig)
 
     logger.info("Combined chart saved → %s", filepath)
     return filepath
@@ -280,21 +299,17 @@ def render_combined_chart(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _render_panel_to_buffer(
+def _prepare_and_slice(
     df:           pd.DataFrame,
     symbol:       str,
     timeframe:    str,
     display_bars: int,
-    figsize:      "tuple[float, float]",
-) -> io.BytesIO:
+) -> pd.DataFrame:
     """
-    Render a single candlestick panel to a BytesIO PNG buffer.
+    Normalise → validate → compute MAs on FULL dataset → slice to display window.
 
-    MAs are computed on the FULL dataset for accuracy, then the view
-    is sliced to *display_bars* before plotting.
-
-    Title is set via axes[0].set_title(loc='center') so it aligns with
-    the K-line chart area rather than the full figure width.
+    MA computation on the full dataset ensures tail values match XQ exactly,
+    regardless of how many bars are shown.
     """
     df_plot = _prepare_dataframe(df)
     df_plot = df_plot.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
@@ -305,141 +320,72 @@ def _render_panel_to_buffer(
             f"(need at least 3)."
         )
 
-    # Compute MAs on the full dataset BEFORE slicing
+    # MA on full dataset BEFORE slicing
     for period in _MA_PERIODS:
         df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
 
-    # Slice to display window
     df_display = df_plot.iloc[-display_bars:].copy()
-
     logger.info(
         "Rendering [%s] %s: displaying last %d of %d bars",
         symbol, timeframe, len(df_display), len(df_plot),
     )
+    return df_display
 
-    # Build MA addplots from the sliced display DataFrame
-    addplots = _build_ma_addplots(df_display)
 
-    # Strip MA columns — mpf.plot() expects pure OHLCV
-    ohlcv_cols = ["Open", "High", "Low", "Close", "Volume"]
-    df_display = df_display[ohlcv_cols]
+def _set_time_ticks(
+    ax,
+    df:               pd.DataFrame,
+    interval_minutes: int,
+    fmt:              str = "%m-%d %H:%M",
+) -> None:
+    """
+    Set x-axis ticks and labels at *interval_minutes* cadence.
 
-    plot_kwargs: dict = dict(
-        type="candle",
-        style=_DARK_STYLE,
-        volume=False,           # 不顯示成交量，讓 K 線圖佔滿垂直空間
-        figsize=figsize,
-        returnfig=True,
-        warn_too_much_data=10_000,
-        show_nontrading=False,
-    )
-    if addplots:
-        plot_kwargs["addplot"] = addplots
+    mplfinance (show_nontrading=False) assigns bar i the integer x-coordinate i,
+    so matplotlib.dates locators cannot be used directly.  Instead we scan the
+    DataFrame's DatetimeIndex for bars whose timestamp is an exact multiple of
+    *interval_minutes* from midnight, then set those integer positions as ticks.
 
-    try:
-        fig, axes = mpf.plot(df_display, **plot_kwargs)
-        ax_main = axes[0]
-        _color_doji_candles(ax_main, df_display)
+    Parameters
+    ----------
+    ax               : The Axes object returned from mpf.plot(ax=...).
+    df               : The sliced display DataFrame (DatetimeIndex, tz-naive).
+    interval_minutes : Tick cadence in minutes.
+                       • 5K  panel → 60   (每 60 分鐘一格)
+                       • 60K panel → 600  (每 10 小時一格)
+    fmt              : strftime format for tick labels.
+    """
+    positions: list[int] = []
+    labels:    list[str] = []
 
-        # ── 置中標題：[品種名稱]  5K / 60K ──────────────────────────────────
-        title = f"[{symbol}]  {timeframe}"
-        title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
-        if _FONT_PROPS is not None:
-            title_kw["fontproperties"] = _FONT_PROPS
-        ax_main.set_title(title, **title_kw)
+    for i, dt in enumerate(df.index):
+        total_min = dt.hour * 60 + dt.minute
+        if total_min % interval_minutes == 0:
+            positions.append(i)
+            labels.append(dt.strftime(fmt))
 
-        # 圖例已移至共用 legend strip，此面板不另建圖例
+    # Fallback: evenly spaced if no bar falls on the exact interval
+    if not positions:
+        step = max(1, len(df) // 8)
+        positions = list(range(0, len(df), step))
+        labels    = [df.index[i].strftime(fmt) for i in positions]
 
-        # tight_layout：極大化繪圖區域，為頂部標題預留 5% 空間
-        try:
-            fig.tight_layout(rect=[0, 0, 1, 0.95])
-        except Exception:
-            pass  # mplfinance 偶爾有 layout 警告，忽略即可
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-
-    except Exception as exc:
-        plt.close("all")
-        logger.error(
-            "Failed to render [%s] %s panel: %s", symbol, timeframe, exc,
-            exc_info=True,
-        )
-        raise RuntimeError(
-            f"Chart rendering failed for [{symbol}] {timeframe}"
-        ) from exc
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=45, ha="right",
+                       fontsize=8, color="#8b949e")
+    # Vertical grid lines at every tick
+    ax.xaxis.grid(True, linestyle="--", color="#2a2a3e", linewidth=0.7)
 
 
 def _build_legend_handles() -> list:
     """
     Build proxy Line2D handles for the shared MA legend.
-    Uses constants directly — no plot object needed.
+    Uses module-level constants directly — no plot object required.
     """
     return [
         mlines.Line2D([], [], color=color, linewidth=width, label=f"MA{period}")
         for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS)
     ]
-
-
-def _render_legend_strip(figwidth: float = 12.0) -> io.BytesIO:
-    """
-    Render a single-row MA legend as a minimal-height PNG strip.
-
-    This strip is stitched between the 5K and 60K panels by
-    render_combined_chart(), giving the visual effect of a shared
-    figure-level legend placed in the gap between the two sub-charts.
-    Height is kept to ~0.45" so the gap stays tight.
-    """
-    handles = _build_legend_handles()
-    fig = plt.figure(figsize=(figwidth, 0.45), facecolor="#0d1117")
-    leg = fig.legend(
-        handles=handles,
-        loc="center",
-        ncol=len(handles),
-        frameon=False,
-        fontsize=9,
-        handlelength=1.5,
-        columnspacing=1.4,
-    )
-    for text in leg.get_texts():
-        text.set_color("#e6edf3")
-        if _FONT_PROPS is not None:
-            text.set_fontproperties(_FONT_PROPS)
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
-                facecolor="#0d1117")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def _build_ma_addplots(df: pd.DataFrame) -> list:
-    """
-    Build mplfinance addplot objects for the pre-computed MA columns in *df*.
-    Columns that are entirely NaN (insufficient history) are silently skipped.
-    Each addplot carries a label for identification (legend uses proxy handles).
-    """
-    result = []
-    for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
-        col = f"MA{period}"
-        if col not in df.columns:
-            continue
-        series = df[col]
-        if series.notna().any():
-            result.append(
-                mpf.make_addplot(
-                    series,
-                    color=color,
-                    width=width,
-                    secondary_y=False,
-                    label=f"MA{period}",
-                )
-            )
-    return result
 
 
 def _color_doji_candles(ax, df: pd.DataFrame, color: str = "#FFD700") -> None:
