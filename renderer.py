@@ -219,16 +219,14 @@ def render_combined_chart(
     ohlcv = ["Open", "High", "Low", "Close", "Volume"]
 
     # ── Single figure, 2 subplots ───────────────────────────────────────────
-    # figsize=(16, 12)：寬幅比例，讓 K 棒間距充足
-    # hspace=0.50：留出足夠縫隙放中間橫排圖例，不擋 60K 標題
+    # figsize=(16, 12)，hspace=0.60：縫隙夠大，圖例不擋時間軸標籤
     fig = plt.figure(figsize=(16, 12), facecolor="#0d1117")
-    gs  = fig.add_gridspec(2, 1, height_ratios=[10, 8], hspace=0.50)
+    fig.patch.set_facecolor("#0d1117")          # 強制畫布底色（深色）
+    gs  = fig.add_gridspec(2, 1, height_ratios=[10, 8], hspace=0.60)
     ax_5k  = fig.add_subplot(gs[0])
     ax_60k = fig.add_subplot(gs[1])
 
     # ── Candlestick via mplfinance (external-axes mode) ─────────────────────
-    # volume=False：讓 K 線圖佔滿整個 Axes
-    # show_nontrading=False：跳過非交易時段，x 座標為連續整數
     _mpf_kwargs = dict(
         type="candle",
         style=_DARK_STYLE,
@@ -239,14 +237,18 @@ def render_combined_chart(
     mpf.plot(df_5k_d[ohlcv],  ax=ax_5k,  **_mpf_kwargs)
     mpf.plot(df_60k_d[ohlcv], ax=ax_60k, **_mpf_kwargs)
 
+    # ── 深色主題修復 ─────────────────────────────────────────────────────────
+    # external-axes 模式下 mplfinance 不自動套用 facecolor/tick 顏色，
+    # 必須在 mpf.plot() 之後手動覆寫。
+    _apply_dark_style(ax_5k)
+    _apply_dark_style(ax_60k)
+
     # ── X 軸時間刻度 ────────────────────────────────────────────────────────
     # 5K：每 60 分鐘一格；60K：每 10 小時（600 分鐘）一格
     _set_time_ticks(ax_5k,  df_5k_d,  interval_minutes=60)
     _set_time_ticks(ax_60k, df_60k_d, interval_minutes=600)
 
     # ── MA lines — overlaid manually at integer x-positions ─────────────────
-    # mplfinance (show_nontrading=False) places bar i at x=i,
-    # so range(len(df)) aligns exactly with each candle centre.
     for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
         col = f"MA{period}"
         for ax, df_d in ((ax_5k, df_5k_d), (ax_60k, df_60k_d)):
@@ -262,6 +264,10 @@ def render_combined_chart(
     _color_doji_candles(ax_5k,  df_5k_d)
     _color_doji_candles(ax_60k, df_60k_d)
 
+    # ── 最高/最低價標注 ──────────────────────────────────────────────────────
+    _annotate_high_low(ax_5k,  df_5k_d)
+    _annotate_high_low(ax_60k, df_60k_d)
+
     # ── Titles (置中，使用 NotoSansTC) ──────────────────────────────────────
     title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
     if _FONT_PROPS is not None:
@@ -269,14 +275,15 @@ def render_combined_chart(
     ax_5k.set_title(f"[{symbol}]  5K",  **title_kw)
     ax_60k.set_title(f"[{symbol}]  60K", **title_kw)
 
-    # ── Global legend — 單行水平，放在兩圖之間的縫隙 ────────────────────────
-    # height_ratios=[10, 8]，hspace=0.50 → 縫隙幾何中心約在 Figure y ≈ 0.495
+    # ── Global legend — 單行水平，放在兩圖縫隙中央偏下 ──────────────────────
+    # hspace=0.60，height_ratios=[10,8] → 縫隙中心 ≈ Figure y 0.47；
+    # 往下移至 0.45 確保不壓到 5K 的 X 軸時間標籤。
     handles = _build_legend_handles()
     leg = fig.legend(
         handles=handles,
         ncol=len(handles),
         loc="center",
-        bbox_to_anchor=(0.5, 0.495),   # 兩圖縫隙的幾何中心
+        bbox_to_anchor=(0.5, 0.45),
         frameon=False,
         fontsize=9,
         handlelength=1.5,
@@ -330,6 +337,81 @@ def _prepare_and_slice(
         symbol, timeframe, len(df_display), len(df_plot),
     )
     return df_display
+
+
+def _apply_dark_style(ax) -> None:
+    """
+    Manually restore dark-theme colours on an external Axes object.
+
+    When mplfinance plots into an externally-created Axes (ax= mode),
+    the style's facecolor / tick colours / spine colours are NOT
+    applied automatically.  This function sets them explicitly so the
+    panel matches the project's dark theme.
+
+    Call this AFTER mpf.plot() so we override anything mplfinance reset.
+    """
+    BG      = "#0d1117"
+    TICK    = "#8b949e"
+    SPINE   = "#30363d"
+    LABEL   = "#c9d1d9"
+    GRID    = "#2a2a3e"
+
+    ax.set_facecolor(BG)
+
+    # Spine (border) colours
+    for spine in ax.spines.values():
+        spine.set_edgecolor(SPINE)
+
+    # Tick + tick-label colours (both axes)
+    ax.tick_params(axis="both", colors=TICK, which="both", labelsize=8)
+
+    # Axis label colours
+    ax.xaxis.label.set_color(LABEL)
+    ax.yaxis.label.set_color(LABEL)
+
+    # Move price labels to the right
+    ax.yaxis.set_label_position("right")
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y", labelcolor=TICK)
+
+    # Horizontal grid lines (vertical added by _set_time_ticks)
+    ax.yaxis.grid(True, linestyle="--", color=GRID, linewidth=0.7)
+    ax.set_axisbelow(True)
+
+
+def _annotate_high_low(ax, df: pd.DataFrame) -> None:
+    """
+    Annotate the highest High (▲) and lowest Low (▼) in the display window.
+
+    Uses integer x-coordinates that match mplfinance's internal axis.
+    Offsets the label slightly so it does not overlap the wick.
+    """
+    hi_pos = int(df["High"].values.argmax())
+    lo_pos = int(df["Low"].values.argmin())
+    hi_val = float(df["High"].iloc[hi_pos])
+    lo_val = float(df["Low"].iloc[lo_pos])
+
+    # Nudge labels inward when they are at the very edges
+    n = len(df)
+    hi_ha = "right" if hi_pos > n * 0.85 else "left"
+    lo_ha = "right" if lo_pos > n * 0.85 else "left"
+
+    ax.annotate(
+        f"▲ {hi_val:.0f}",
+        xy=(hi_pos, hi_val),
+        xytext=(-4 if hi_ha == "right" else 4, 4),
+        textcoords="offset points",
+        ha=hi_ha, va="bottom",
+        color="#FF6B6B", fontsize=8, fontweight="bold", zorder=6,
+    )
+    ax.annotate(
+        f"▼ {lo_val:.0f}",
+        xy=(lo_pos, lo_val),
+        xytext=(-4 if lo_ha == "right" else 4, -4),
+        textcoords="offset points",
+        ha=lo_ha, va="top",
+        color="#51CF66", fontsize=8, fontweight="bold", zorder=6,
+    )
 
 
 def _set_time_ticks(
