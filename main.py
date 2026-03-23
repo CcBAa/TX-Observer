@@ -46,7 +46,6 @@ from datetime import time as dtime
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -71,10 +70,13 @@ from renderer import render_combined_chart           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-_BARS_5K  = 400     # 1-min → 5K: 240 (MA240) + 120 (display) + buffer
-_BARS_60K = 350     # 1-min → 60K: 240 (MA240) + 80 (display) + buffer
-_BARS_1MIN_FOR_DAILY = 20_000  # 1-min bars fetched for daily-K resample
-                                # 20000 ÷ 270 min/day ≈ 74 trading days ≫ 45
+# Display bars requested from fetcher.  fetcher.py internally fetches a larger
+# buffer (≥ _MA_COMPUTE_MIN_BARS = 300) for accurate MA computation, then slices
+# to these counts before returning.  The returned DataFrames already include
+# pre-computed MA5/10/20/60/240 columns so renderer.py skips recomputation.
+_DISPLAY_5K    = 90    # 台指期 5K  顯示根數
+_DISPLAY_60K   = 65    # 共用   60K 顯示根數
+_DISPLAY_DAILY = 45    # 現貨  日K  顯示根數
 
 # Symbols dispatched in each job
 _FUTURES_SYMBOLS: list[tuple[str, str]] = [
@@ -218,50 +220,6 @@ def run_market_check() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Spot daily-K helper — resample 1-min data into daily bars
-# ---------------------------------------------------------------------------
-
-def _resample_spot_to_daily(df_1min: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate spot 1-min OHLCV bars into one daily bar per trading day.
-
-    The output index is the midnight timestamp of each trading date
-    (tz-aware Asia/Taipei), which renderer._prepare_dataframe() will later
-    convert to tz-naive for mplfinance.
-
-    Parameters
-    ----------
-    df_1min : DataFrame returned by fetcher.fetch_bars("1min", ...) for a
-              spot symbol.  "Datetime" is a column (tz-aware Asia/Taipei).
-
-    Returns
-    -------
-    DataFrame with columns: Datetime, Open, High, Low, Close, Volume.
-    """
-    df = df_1min.copy()
-    if "Datetime" in df.columns:
-        df = df.set_index("Datetime")
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-
-    # Group every bar from the same calendar date into one daily bar.
-    # normalize() floors tz-aware timestamps to midnight in their own tz,
-    # so each trading day's 09:00–13:30 bars collapse to one key.
-    date_keys = df.index.normalize()
-
-    df_daily = df.groupby(date_keys).agg(
-        Open=("Open",   "first"),
-        High=("High",   "max"),
-        Low=("Low",     "min"),
-        Close=("Close", "last"),
-        Volume=("Volume","sum"),
-    )
-    df_daily.index.name = "Datetime"
-    return df_daily.reset_index()
-
-
-# ---------------------------------------------------------------------------
 # Core job pipeline
 # ---------------------------------------------------------------------------
 
@@ -303,19 +261,14 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
         fetcher = ShioajiDataFetcher(symbol)
 
         if is_spot:
-            # ── 現貨模式：日K (上) + 60K (下) ──────────────────────────────
-            logger.info(
-                "[%s] Fetching %d 1-min bars for daily-K resample...",
-                display_name, _BARS_1MIN_FOR_DAILY,
-            )
-            df_1min  = fetcher.fetch_bars("1min", bars=_BARS_1MIN_FOR_DAILY)
-            df_upper = _resample_spot_to_daily(df_1min)
-            logger.info(
-                "[%s] Daily-K resample done: %d bars.", display_name, len(df_upper)
-            )
+            # ── 現貨模式：日K (上, 45根) + 60K (下, 65根) ───────────────────
+            # fetcher 內部抓取 ≥300 根日K 計算 MA240，切片後傳回 _DISPLAY_DAILY 根。
+            logger.info("[%s] Fetching %d daily bars (with MA buffer)...",
+                        display_name, _DISPLAY_DAILY)
+            df_upper = fetcher.fetch_bars("1day",  bars=_DISPLAY_DAILY)
 
-            logger.info("[%s] Fetching %d 60-min bars...", display_name, _BARS_60K)
-            df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
+            logger.info("[%s] Fetching %d 60-min bars...", display_name, _DISPLAY_60K)
+            df_60k = fetcher.fetch_bars("60min", bars=_DISPLAY_60K)
 
             logger.info("[%s] Rendering combined 日K+60K chart...", display_name)
             chart_path = render_combined_chart(
@@ -326,12 +279,13 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
             chart_desc = "日K + 60K 合圖"
 
         else:
-            # ── 期貨模式：5K (上) + 60K (下) ───────────────────────────────
-            logger.info("[%s] Fetching %d 5-min bars...", display_name, _BARS_5K)
-            df_upper = fetcher.fetch_bars("5min", bars=_BARS_5K)
+            # ── 期貨模式：60K (上, 65根) + 5K (下, 90根) ────────────────────
+            # fetcher 內部抓取 ≥300 根計算 MA240，切片後傳回目標根數。
+            logger.info("[%s] Fetching %d 5-min bars...", display_name, _DISPLAY_5K)
+            df_upper = fetcher.fetch_bars("5min",  bars=_DISPLAY_5K)
 
-            logger.info("[%s] Fetching %d 60-min bars...", display_name, _BARS_60K)
-            df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
+            logger.info("[%s] Fetching %d 60-min bars...", display_name, _DISPLAY_60K)
+            df_60k = fetcher.fetch_bars("60min", bars=_DISPLAY_60K)
 
             logger.info("[%s] Rendering combined 5K+60K chart...", display_name)
             chart_path = render_combined_chart(

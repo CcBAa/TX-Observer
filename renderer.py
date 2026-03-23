@@ -385,9 +385,17 @@ def _prepare_and_slice(
             f"(need at least 3)."
         )
 
-    # MA on full dataset BEFORE slicing
-    for period in _MA_PERIODS:
-        df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
+    # MA computation — skip if fetcher.py already pre-computed on a full buffer.
+    # Pre-computed columns survive _prepare_dataframe() (which now preserves them).
+    # Recomputing on a small display slice (e.g. 45 bars) would produce mostly-NaN
+    # MA240; using fetcher's values computed on ≥300 bars is always more accurate.
+    if f"MA{_MA_PERIODS[0]}" in df_plot.columns:
+        logger.debug(
+            "[%s] %s: MA 欄位由 fetcher 預計算，略過重新計算。", symbol, timeframe
+        )
+    else:
+        for period in _MA_PERIODS:
+            df_plot[f"MA{period}"] = df_plot["Close"].rolling(period).mean()
 
     df_display = df_plot.iloc[-display_bars:].copy()
     logger.info(
@@ -589,4 +597,10 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"DataFrame is missing required columns: {missing}")
 
-    return df[required_cols]
+    # Preserve pre-computed MA columns from fetcher.py so _prepare_and_slice
+    # can detect them and skip redundant rolling computation.
+    ma_cols = sorted(
+        [c for c in df.columns if c.startswith("MA") and c[2:].isdigit()],
+        key=lambda x: int(x[2:]),
+    )
+    return df[required_cols + ma_cols]
