@@ -18,17 +18,17 @@ Timeframe support
 MA pre-computation
 ------------------
   fetch_bars() always computes MA5/10/20/60/240 on a FULL buffer dataset
-  (≥ _MA_COMPUTE_MIN_BARS resampled bars) BEFORE slicing to the requested
-  display window.  The returned DataFrame therefore contains pre-computed
-  MA columns so that renderer.py can skip recomputation and still display
-  correct long-period MA values (e.g. MA240) even when only 45 or 65 bars
-  are shown.
+  (≥ _MA_BUFFER_PER_TF[timeframe] resampled bars) BEFORE slicing to the
+  requested display window.  The returned DataFrame contains pre-computed
+  MA columns so renderer.py can skip recomputation and still display
+  correct long-period MA values (e.g. MA240) even for small display windows.
 
-  Buffer strategy:
-    fetch_count = max(bars, _MA_COMPUTE_MIN_BARS)   # always ≥ 300
-    → resample to fetch_count bars
-    → compute MA on fetch_count bars        (tail values match XQ)
-    → slice to bars                         (display window with correct MA)
+  Per-timeframe buffer strategy:
+    "1day"  : fetch_count = max(bars, 300)   → display  45  daily bars
+    "60min" : fetch_count = max(bars, 500)   → display  65  hourly bars
+    "5min"  : fetch_count = max(bars, 300)   → display  90  5-min bars
+    → compute MA on fetch_count bars         (tail values match XQ)
+    → slice to bars                          (display window with correct MA)
 
   If the API cannot return enough data for a given MA period, a warning
   is logged but no exception is raised — the MA column simply contains NaN.
@@ -45,8 +45,8 @@ Spot  1D  : per-calendar-date groupby of the spot 09:00–13:30 session
 Token expiry
 ------------
 Cross-weekend session invalidation is handled transparently: each call to
-api.kbars() retries once after _force_relogin() if a TokenError (HTTP 401)
-is detected.
+api.kbars() retries up to twice after _force_relogin() if a TokenError
+(HTTP 401) is detected, covering double-expiry on long-running processes.
 """
 
 import atexit
@@ -113,10 +113,22 @@ _SPOT_SYMBOLS: dict[str, tuple[str, str]] = {
 # Must match renderer._MA_PERIODS so that renderer can detect and reuse them.
 _MA_PERIODS_COMPUTE: list[int] = [5, 10, 20, 60, 240]
 
-# Minimum resampled bars fetched from the API before MA computation.
-# This guarantees that MA240 has a valid (non-NaN) value at the tail even
-# when only a small display window (e.g. 45 daily bars) is requested.
-_MA_COMPUTE_MIN_BARS: int = 300
+# Per-timeframe MA computation buffer sizes.
+#
+# Before slicing to the display window, fetch_bars() always fetches at least
+# this many *resampled* bars so that MA240 (年線) has a valid tail value:
+#
+#   "1day"  → 300 daily bars  ≈ 14 months  (display: 45)
+#   "60min" → 500 hourly bars ≈ 20 weeks   (display: 65)
+#   "5min"  → 300 5-min bars  ≈ 3–4 days   (display: 90)
+#
+# All other timeframes fall back to the default (300).
+_MA_BUFFER_PER_TF: dict[str, int] = {
+    "1day":  300,
+    "60min": 500,
+    "5min":  300,
+}
+_MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 
 # Approximate trading minutes per resampled bar — used to calculate how many
 # 1-min bars the API needs to cover for _MA_COMPUTE_MIN_BARS resampled bars.
@@ -649,10 +661,11 @@ def _compute_and_attach_ma(df: pd.DataFrame, symbol: str, timeframe: str) -> pd.
                 "[%s] %s: MA%d 全為 NaN — 僅有 %d 根資料，至少需要 %d 根。",
                 symbol, timeframe, period, n, period,
             )
-        elif n < _MA_COMPUTE_MIN_BARS and period == max(_MA_PERIODS_COMPUTE):
+        elif n < _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS) and period == max(_MA_PERIODS_COMPUTE):
+            target = _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS)
             logger.warning(
                 "[%s] %s: 僅取得 %d 根（目標 %d 根），MA%d 末端可能不準確。",
-                symbol, timeframe, n, _MA_COMPUTE_MIN_BARS, period,
+                symbol, timeframe, n, target, period,
             )
     return df
 
@@ -668,7 +681,8 @@ class ShioajiDataFetcher:
     Key behaviour change vs. earlier version
     -----------------------------------------
     fetch_bars() now:
-      1. Fetches fetch_count = max(bars, _MA_COMPUTE_MIN_BARS) resampled bars.
+      1. Fetches fetch_count = max(bars, _MA_BUFFER_PER_TF[timeframe]) bars.
+         (1day→300, 60min→500, 5min→300 — ensures MA240 is non-NaN at tail)
       2. Computes MA5/10/20/60/240 on those fetch_count bars.
       3. Slices to the last *bars* rows.
       4. Returns the slice WITH MA columns attached.
@@ -703,8 +717,11 @@ class ShioajiDataFetcher:
                     "60min", "1day".
                     "1day" is only valid for spot symbols (TSE/OTC).
         bars      : Number of display bars to return (most recent N).
-                    Internally, max(bars, _MA_COMPUTE_MIN_BARS) bars are
-                    fetched from the API so that MA240 is always calculable.
+                    Internally, max(bars, _MA_BUFFER_PER_TF[timeframe]) bars
+                    are fetched so that MA240 (年線) is always calculable:
+                      "1day"  → buffer 300 bars  (display 45)
+                      "60min" → buffer 500 bars  (display 65)
+                      "5min"  → buffer 300 bars  (display 90)
         start     : Date string "yyyy-mm-dd".  Auto-derived if omitted.
         end       : Date string "yyyy-mm-dd".  Defaults to today.
 
@@ -714,8 +731,8 @@ class ShioajiDataFetcher:
           Datetime (tz-aware Asia/Taipei), Open, High, Low, Close, Volume,
           MA5, MA10, MA20, MA60, MA240.
 
-        MA values are computed on the full internal buffer (≥ 300 bars) so
-        that even MA240 is non-NaN at the tail of the display slice.
+        MA values are computed on the full internal buffer before slicing,
+        so even MA240 is non-NaN at the tail of the display window.
         """
         supported = set(_TIMEFRAME_MIN.keys())
         if timeframe not in supported:
@@ -733,9 +750,11 @@ class ShioajiDataFetcher:
         min_per_bar = _TIMEFRAME_MIN[timeframe]
 
         # ── Buffer size for MA computation ──────────────────────────────────
-        # Always fetch at least _MA_COMPUTE_MIN_BARS resampled bars so that
-        # MA240 has a valid tail value even when bars < 240.
-        fetch_count = max(bars, _MA_COMPUTE_MIN_BARS)
+        # Use the per-timeframe minimum defined in _MA_BUFFER_PER_TF so that
+        # MA240 has a valid (non-NaN) tail value even for small display windows:
+        #   1day  → 300 bars   60min → 500 bars   5min → 300 bars
+        tf_min_bars = _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS)
+        fetch_count = max(bars, tf_min_bars)
         needed_1min = int(fetch_count * min_per_bar * 1.5)
 
         # ── Date range ──────────────────────────────────────────────────────
@@ -756,7 +775,9 @@ class ShioajiDataFetcher:
         )
 
         # ── API call with Token-expiry retry ────────────────────────────────
-        _MAX_RELOGIN = 1
+        # Up to 2 re-login attempts to handle cross-weekend invalidation and
+        # occasional double-expiry on long-running processes.
+        _MAX_RELOGIN = 2
         kbars = None
         for _attempt in range(_MAX_RELOGIN + 1):
             api      = _get_api()
@@ -769,8 +790,8 @@ class ShioajiDataFetcher:
 
                 if _is_token_error(exc) and _attempt < _MAX_RELOGIN:
                     logger.warning(
-                        "[%s] Token 過期 (401)，嘗試第 %d 次自動重新登入...",
-                        self._symbol, _attempt + 1,
+                        "[%s] Token 過期 (401)，嘗試第 %d/%d 次自動重新登入...",
+                        self._symbol, _attempt + 1, _MAX_RELOGIN,
                     )
                     _force_relogin()
                     continue

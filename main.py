@@ -10,37 +10,49 @@ Supported symbols
 Scheduler design — trigger times (Asia/Taipei)  ← all triggers fire at :10 s
 -----------------------------------------------
   ┌────────────────┬──────────────────────────────────────────────────────┐
-  │  Futures (TXF) │  Day : 08:45:10  09:45:10 … 13:45:10                │
-  │                │  Night (early) Mon–Fri : 15:00:10 … 23:00:10        │
-  │                │  Night (late)  Tue–Sat : 00:00:10 … 05:00:10        │
+  │  Futures (TXF) │  Day   : 08:45  09:45  10:45  11:45  12:45          │
+  │                │  Close : 13:45  (dedicated closing, retry×3)        │
+  │                │  Night : 15:00  16:00  17:00  18:00  19:00  20:00   │
+  │                │          21:00  22:00  23:00  (Mon–Fri)             │
+  │                │          00:00  01:00  02:00  03:00  04:00  05:00   │
+  │                │          (Tue–Sat, 05:00 = 夜盤收盤)                 │
   ├────────────────┼──────────────────────────────────────────────────────┤
-  │  Spot (TSE/OTC)│  09:00:10  10:00:10  11:00:10  12:00:10  13:00:10   │
+  │  Spot (TSE/OTC)│  Day   : 09:00  10:00  11:00  12:00  13:00          │
+  │                │  Close : 13:45  (dedicated closing, retry×3)        │
+  │                │  (no night session)                                  │
   └────────────────┴──────────────────────────────────────────────────────┘
 
   The 10-second delay ensures the exchange has finished writing the just-
   closed bar to the database before we query it.
 
+  Closing summary jobs (13:45:10 for both futures and spot) are separate
+  dedicated triggers.  They fire with a "【今日收盤總結】" label in the
+  LINE push and retry up to 3 times (5-second gap) to handle late API
+  data delivery at session close.
+
 Chart modes
 -----------
-  Futures (TXFR1) : 5K  (90 bars, upper) + 60K (65 bars, lower)
+  Futures (TXFR1) : 60K (65 bars, upper) + 5K  (90 bars, lower)
   Spot (TSE/OTC)  : 日K (45 bars, upper) + 60K (65 bars, lower)
 
 Error isolation
 ---------------
   If one symbol fails (fetch / render / upload / push), the error is logged
   and execution continues to the next symbol without crashing the scheduler.
+  Closing jobs retry up to _CLOSING_MAX_RETRIES times before giving up.
 
 Shioaji login
 -------------
   The API singleton is initialized once at startup via fetcher.init_api().
   Individual job calls reuse the cached singleton — no re-login per task.
-  Token-expiry auto re-login is handled inside fetcher.py (up to 1 retry
+  Token-expiry auto re-login is handled inside fetcher.py (up to 2 retries
   per fetch call), covering cross-weekend session invalidation.
 """
 
 import argparse
 import logging
 import sys
+import time
 from datetime import datetime
 from datetime import time as dtime
 from pathlib import Path
@@ -71,12 +83,17 @@ TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
 # Display bars requested from fetcher.  fetcher.py internally fetches a larger
-# buffer (≥ _MA_COMPUTE_MIN_BARS = 300) for accurate MA computation, then slices
+# buffer (≥ _MA_COMPUTE_MIN_BARS = 500) for accurate MA computation, then slices
 # to these counts before returning.  The returned DataFrames already include
 # pre-computed MA5/10/20/60/240 columns so renderer.py skips recomputation.
 _DISPLAY_5K    = 90    # 台指期 5K  顯示根數
 _DISPLAY_60K   = 65    # 共用   60K 顯示根數
 _DISPLAY_DAILY = 45    # 現貨  日K  顯示根數
+
+# Closing summary retry policy — applied to both 13:45 spot and 13:45 futures
+# jobs to handle API data delivery delays at session close.
+_CLOSING_MAX_RETRIES = 3
+_CLOSING_RETRY_DELAY = 5.0   # seconds between retries
 
 # Symbols dispatched in each job
 _FUTURES_SYMBOLS: list[tuple[str, str]] = [
@@ -223,23 +240,32 @@ def run_market_check() -> None:
 # Core job pipeline
 # ---------------------------------------------------------------------------
 
-def _run_symbol_job(symbol: str, display_name: str) -> None:
+def _run_symbol_job(
+    symbol: str,
+    display_name: str,
+    closing_summary: bool = False,
+) -> None:
     """
     Complete pipeline for a single symbol:
 
     Futures (TXFR1)
-      fetch 5K + 60K  →  render 5K+60K chart  →  upload  →  LINE push
+      fetch 60K + 5K  →  render 60K+5K chart  →  upload  →  LINE push
 
     Spot (TSE/001 / OTC/101)
       fetch 1min → resample to 日K
       fetch 60K
       →  render 日K+60K chart  →  upload  →  LINE push
 
+    Parameters
+    ----------
+    closing_summary : When True the LINE push is prefixed with
+                      "【今日收盤總結】" to identify end-of-session charts.
+
     Errors are raised (not swallowed) so the caller can isolate them
     per-symbol without killing the scheduler.
 
     Token-expiry auto re-login is handled transparently inside fetcher.py
-    (up to 1 retry per fetch call via _force_relogin()), so no additional
+    (up to 2 retries per fetch call via _force_relogin()), so no additional
     re-login logic is required here.
     """
     now = datetime.now(tz=TW_TZ)
@@ -305,6 +331,9 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
         pct    = (chg / prev * 100.0) if prev else 0.0
         arrow  = "▲" if chg >= 0 else "▼"
 
+        # Closing summary prefix — applied when this is an end-of-session job
+        closing_prefix = "【今日收盤總結】\n" if closing_summary else ""
+
         # Settlement day prefix — TXFR1 only, third Wednesday of each month
         settlement_prefix = ""
         if symbol == "TXFR1" and is_settlement_day(now):
@@ -312,7 +341,8 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
             logger.info("[%s] 今日為台指期結算日。", display_name)
 
         push_text = (
-            settlement_prefix
+            closing_prefix
+            + settlement_prefix
             + f"[TX-Observer]  {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
             f"{display_name} ({symbol})\n"
             f"Last:    {latest:>10,.0f}\n"
@@ -410,6 +440,87 @@ def run_spot_job() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Retry wrapper — used by closing summary jobs
+# ---------------------------------------------------------------------------
+
+def _run_symbol_job_with_retry(
+    symbol: str,
+    display_name: str,
+    closing_summary: bool = False,
+    max_retries: int = _CLOSING_MAX_RETRIES,
+    retry_delay: float = _CLOSING_RETRY_DELAY,
+) -> None:
+    """
+    Execute _run_symbol_job() with automatic retry on failure.
+
+    Retries up to *max_retries* times with *retry_delay* seconds between
+    attempts.  Designed for closing summary jobs where API data delivery
+    may lag slightly after the session-close timestamp.
+
+    Errors are swallowed after the final attempt so one symbol failure
+    never propagates to the next symbol in the same job.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            _run_symbol_job(symbol, display_name, closing_summary=closing_summary)
+            return   # success — exit retry loop
+        except Exception as exc:
+            if attempt < max_retries:
+                logger.warning(
+                    "[%s] 第 %d/%d 次失敗，%g 秒後重試: %s",
+                    display_name, attempt, max_retries, retry_delay, exc,
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.error(
+                    "[%s] 已重試 %d 次，最終失敗: %s",
+                    display_name, max_retries, exc,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Closing summary job entrypoints
+# ---------------------------------------------------------------------------
+
+def run_spot_closing_job() -> None:
+    """
+    現貨收盤總結任務 — TSE/001 + OTC/101.
+
+    Fires at 13:30:10 (Mon–Fri) — 10 s after the spot market close.
+    Renders 日K (上, 45根) + 60K (下, 65根) to capture the final daily bar.
+    Retries up to _CLOSING_MAX_RETRIES times with 5-second intervals to
+    handle late data delivery at session end.
+    """
+    if not _market_open_today:
+        return
+
+    now = datetime.now(tz=TW_TZ)
+    logger.info("=== Spot Closing Summary job start (%s) ===", now.strftime("%H:%M:%S"))
+
+    for symbol, name in _SPOT_SYMBOLS:
+        _run_symbol_job_with_retry(symbol, name, closing_summary=True)
+
+
+def run_futures_closing_job() -> None:
+    """
+    期貨收盤總結任務 — TXFR1.
+
+    Fires at 13:45:10 (Mon–Fri) — 10 s after the futures day-session close.
+    Renders 60K (上, 65根) + 5K (下, 90根) to confirm the final 5K and 60K
+    bars are fully settled.
+    Retries up to _CLOSING_MAX_RETRIES times with 5-second intervals.
+    """
+    if not _market_open_today:
+        return
+
+    now = datetime.now(tz=TW_TZ)
+    logger.info("=== Futures Closing Summary job start (%s) ===", now.strftime("%H:%M:%S"))
+
+    for symbol, name in _FUTURES_SYMBOLS:
+        _run_symbol_job_with_retry(symbol, name, closing_summary=True)
+
+
+# ---------------------------------------------------------------------------
 # Scheduler setup
 # ---------------------------------------------------------------------------
 
@@ -422,39 +533,67 @@ def build_scheduler() -> BlockingScheduler:
 
     Futures triggers (TXF)
     ──────────────────────
-    A. Day session     Mon–Fri  08:45:10  09:45:10 … 13:45:10
-    B. Night (early)   Mon–Fri  15:00:10  16:00:10 … 23:00:10
-    C. Night (late)    Tue–Sat  00:00:10  01:00:10 … 05:00:10
+    A. Day session (regular)  Mon–Fri  08:45  09:45  10:45  11:45  12:45
+    B. Futures closing        Mon–Fri  13:45:10  (dedicated, retry×3)
+    C. Night (early)          Mon–Fri  15:00  16:00  17:00  18:00  19:00
+                                        20:00  21:00  22:00  23:00
+    D. Night (late)           Tue–Sat  00:00  01:00  02:00  03:00  04:00  05:00
 
     Spot triggers (TSE/OTC)
     ───────────────────────
-    D. Day session     Mon–Fri  09:00:10  10:00:10 … 13:00:10
+    E. Day session (regular)  Mon–Fri  09:00  10:00  11:00  12:00  13:00
+    F. Spot closing           Mon–Fri  13:45:10  (dedicated, retry×3)
+
+    Other
+    ─────
+    G. Daily market-open check  Mon–Sat  08:30:00
 
     misfire_grace_time=120 s allows catch-up if the host was briefly
     suspended (e.g. cloud VM live-migration).
+    Closing jobs use misfire_grace_time=300 s for extra tolerance.
     """
     scheduler = BlockingScheduler(timezone=TW_TZ)
 
-    _common_futures = dict(func=run_futures_job, misfire_grace_time=120,
-                           replace_existing=True)
-    _common_spot    = dict(func=run_spot_job,    misfire_grace_time=120,
-                           replace_existing=True)
+    _common_futures  = dict(func=run_futures_job,         misfire_grace_time=120,
+                            replace_existing=True)
+    _common_spot     = dict(func=run_spot_job,            misfire_grace_time=120,
+                            replace_existing=True)
+    _common_closing  = dict(misfire_grace_time=300, replace_existing=True)
 
-    # A. TXF day session — fires 10 s after each :45 bar close
+    # A. TXF day session (regular) — fires 10 s after each :45 bar close
+    #    Hour 13 is intentionally excluded: the 13:45 close is handled by
+    #    the dedicated futures closing job (B) to enable retry logic and the
+    #    【今日收盤總結】 LINE push label.
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
             day_of_week="mon-fri",
-            hour="8,9,10,11,12,13",
+            hour="8,9,10,11,12",
             minute=45,
             second=10,
             timezone=TW_TZ,
         ),
         id="txf_day",
-        name="TXF Day Session (08:45:10–13:45:10 on :45)",
+        name="TXF Day Session regular (08:45:10–12:45:10 on :45)",
     )
 
-    # B. TXF night session early (15:00:10–23:00:10)
+    # B. TXF closing summary — 13:45:10, with retry + 【今日收盤總結】 push
+    scheduler.add_job(
+        func=run_futures_closing_job,
+        **_common_closing,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=13,
+            minute=45,
+            second=10,
+            timezone=TW_TZ,
+        ),
+        id="txf_closing",
+        name="TXF Closing Summary (13:45:10)",
+    )
+
+    # C. TXF night session early — every hour 15:00–23:00 (Mon–Fri).
+    #    Covers the full 15:00 open through 23:00 checkpoint.
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
@@ -468,7 +607,8 @@ def build_scheduler() -> BlockingScheduler:
         name="TXF Night Session Early (15:00:10–23:00:10)",
     )
 
-    # C. TXF night session late (00:00:10–05:00:10, next calendar day)
+    # D. TXF night session late — every hour 00:00–05:00 (Tue–Sat).
+    #    Covers the cross-midnight tail through 05:00 夜盤收盤.
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
@@ -482,7 +622,7 @@ def build_scheduler() -> BlockingScheduler:
         name="TXF Night Session Late (00:00:10–05:00:10)",
     )
 
-    # D. Spot indices (TSE/OTC) — fires 10 s after each :00 bar close
+    # E. Spot indices (TSE/OTC) — fires 10 s after each :00 bar close
     scheduler.add_job(
         **_common_spot,
         trigger=CronTrigger(
@@ -496,7 +636,24 @@ def build_scheduler() -> BlockingScheduler:
         name="Spot Indices Day Session (09:00:10–13:00:10)",
     )
 
-    # E. Daily market-open check (08:30) — must fire before 08:45 futures job.
+    # F. Spot closing summary — 13:45:10, with retry + 【今日收盤總結】 push.
+    #    Fires 15 minutes after the 13:30 spot close; 13:45 is shared with the
+    #    futures closing trigger (B) and both run concurrently without conflict.
+    scheduler.add_job(
+        func=run_spot_closing_job,
+        **_common_closing,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=13,
+            minute=45,
+            second=10,
+            timezone=TW_TZ,
+        ),
+        id="spot_closing",
+        name="Spot Closing Summary (13:45:10)",
+    )
+
+    # G. Daily market-open check (08:30) — must fire before 08:45 futures job.
     #    mon-sat covers Saturday make-up sessions where the market reopens.
     #    misfire_grace_time=300 s so the check still runs after a brief VM resume.
     scheduler.add_job(
@@ -581,7 +738,9 @@ def main() -> None:
     scheduler = build_scheduler()
     logger.info(
         "Scheduler started (UTC+8). "
-        "Triggers: TXF day :45:10 | TXF night hourly :10s | Spot 9–13:00:10. "
+        "TXF day: 08:45–12:45 + closing 13:45 | "
+        "TXF night: 15:00–23:00 + 00:00–05:00 (every hour) | "
+        "Spot: 09:00–13:00 + closing 13:45. "
         "Press Ctrl+C to stop."
     )
 
