@@ -3,11 +3,14 @@ renderer.py — Headless K-line chart rendering for TX-Observer.
 
 Public API
 ----------
-render_combined_chart(df_5k, df_60k, symbol, output_dir) → Path
-    Renders 5K and 60K charts into a single combined PNG image:
-      - Upper panel (~56% height): 5K candlestick + MA lines
+render_combined_chart(df_upper, df_60k, symbol, output_dir, mode) → Path
+    Renders upper and 60K charts into a single combined PNG image:
+      - Upper panel (~56% height): candlestick + MA lines
       - Shared legend row: single horizontal MA legend strip between panels
       - Lower panel (~44% height): 60K candlestick + MA lines
+
+    mode="futures"  →  upper panel = 5K  (90 bars),  x-axis format %m-%d %H:%M
+    mode="spot"     →  upper panel = 日K (45 bars),  x-axis format %y-%m-%d
 
 Design notes
 ------------
@@ -165,8 +168,9 @@ _MA_COLORS  = ["#FFD700", "#00BFFF", "#FF69B4", "#FFA500", "#FFFFFF"]
 _MA_WIDTHS  = [1.0,       1.0,       1.0,       1.2,       1.5     ]
 
 # Display window sizes
-_5K_DISPLAY_BARS  = 90    # ~7.5 小時的 5 分 K
-_60K_DISPLAY_BARS = 65    # ~65 根 60 分 K（約 3.25 個交易週）
+_5K_DISPLAY_BARS    = 90    # 台指期 5K  顯示根數（約 7.5 小時）
+_DAILY_DISPLAY_BARS = 45    # 現貨  日K  顯示根數（約兩個月）
+_60K_DISPLAY_BARS   = 65    # 共用  60K  顯示根數（約 3.25 週）
 
 DEFAULT_OUTPUT_DIR = Path("charts")
 
@@ -176,45 +180,68 @@ DEFAULT_OUTPUT_DIR = Path("charts")
 # ---------------------------------------------------------------------------
 
 def render_combined_chart(
-    df_5k:      pd.DataFrame,
+    df_upper:   pd.DataFrame,
     df_60k:     pd.DataFrame,
     symbol:     str,
     output_dir: "Path | str" = DEFAULT_OUTPUT_DIR,
+    mode:       str = "futures",
 ) -> Path:
     """
-    Render 5K and 60K panels into a single combined PNG.
+    Render upper and 60K panels into a single combined PNG.
 
     Layout
     ------
     Single matplotlib Figure with 2 GridSpec rows:
-      Row 0 (height 10): 5K candles + MA overlays
+      Row 0 (height 10): upper candles + MA overlays
       Row 1 (height  8): 60K candles + MA overlays
       hspace gap between rows hosts the shared fig.legend()
 
     Parameters
     ----------
-    df_5k      : OHLCV DataFrame at 5-min resolution.
+    df_upper   : OHLCV DataFrame.
+                 mode="futures" → 5-min bars (TXFR1).
+                 mode="spot"    → daily bars (TSE/001, OTC/101).
     df_60k     : OHLCV DataFrame at 60-min resolution.
-    symbol     : Display name, e.g. "台指期近一".
+    symbol     : Display name, e.g. "台指期近一" or "加權指數".
     output_dir : Output directory. Created if absent.
+    mode       : "futures" or "spot".
+                 Controls display bar count, upper panel title, and x-axis
+                 tick format.
 
     Returns
     -------
     Path to the saved PNG file.
     """
+    if mode not in ("futures", "spot"):
+        raise ValueError(f"render_combined_chart: unknown mode '{mode}'. "
+                         "Use 'futures' or 'spot'.")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     now_tw   = datetime.now(tz=TW_TZ)
     safe_sym = symbol.replace("/", "-").replace(" ", "_")
-    filename = f"{safe_sym}_5k60k_{now_tw.strftime('%Y%m%d_%H%M')}.png"
+
+    if mode == "spot":
+        upper_display_bars = _DAILY_DISPLAY_BARS   # 45 根日K
+        upper_label        = "日K"
+        upper_fmt          = "%y-%m-%d"
+        file_tag           = "dayk60k"
+    else:
+        upper_display_bars = _5K_DISPLAY_BARS       # 90 根 5K
+        upper_label        = "5K"
+        upper_fmt          = "%m-%d %H:%M"
+        file_tag           = "5k60k"
+
+    filename = f"{safe_sym}_{file_tag}_{now_tw.strftime('%Y%m%d_%H%M')}.png"
     filepath = (output_dir / filename).resolve()
 
-    logger.info("Rendering combined chart [%s] 5K+60K...", symbol)
+    logger.info("Rendering combined chart [%s] %s+60K (mode=%s)...",
+                symbol, upper_label, mode)
 
     # ── Data preparation ────────────────────────────────────────────────────
-    df_5k_d  = _prepare_and_slice(df_5k,  symbol, "5K",  _5K_DISPLAY_BARS)
-    df_60k_d = _prepare_and_slice(df_60k, symbol, "60K", _60K_DISPLAY_BARS)
+    df_upper_d = _prepare_and_slice(df_upper, symbol, upper_label, upper_display_bars)
+    df_60k_d   = _prepare_and_slice(df_60k,   symbol, "60K",       _60K_DISPLAY_BARS)
 
     ohlcv = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -223,8 +250,8 @@ def render_combined_chart(
     fig = plt.figure(figsize=(16, 12), facecolor="#0d1117")
     fig.patch.set_facecolor("#0d1117")          # 強制畫布底色（深色）
     gs  = fig.add_gridspec(2, 1, height_ratios=[10, 8], hspace=0.60)
-    ax_5k  = fig.add_subplot(gs[0])
-    ax_60k = fig.add_subplot(gs[1])
+    ax_upper = fig.add_subplot(gs[0])
+    ax_60k   = fig.add_subplot(gs[1])
 
     # ── Candlestick via mplfinance (external-axes mode) ─────────────────────
     _mpf_kwargs = dict(
@@ -234,24 +261,27 @@ def render_combined_chart(
         warn_too_much_data=10_000,
         show_nontrading=False,
     )
-    mpf.plot(df_5k_d[ohlcv],  ax=ax_5k,  **_mpf_kwargs)
-    mpf.plot(df_60k_d[ohlcv], ax=ax_60k, **_mpf_kwargs)
+    mpf.plot(df_upper_d[ohlcv], ax=ax_upper, **_mpf_kwargs)
+    mpf.plot(df_60k_d[ohlcv],   ax=ax_60k,   **_mpf_kwargs)
 
     # ── 深色主題修復 ─────────────────────────────────────────────────────────
     # external-axes 模式下 mplfinance 不自動套用 facecolor/tick 顏色，
     # 必須在 mpf.plot() 之後手動覆寫。
-    _apply_dark_style(ax_5k)
+    _apply_dark_style(ax_upper)
     _apply_dark_style(ax_60k)
 
     # ── X 軸時間刻度 ────────────────────────────────────────────────────────
-    # 5K：每 60 分鐘一格；60K：每 10 小時（600 分鐘）一格
-    _set_time_ticks(ax_5k,  df_5k_d,  interval_minutes=60)
+    # 期貨 5K：每 60 分鐘一格；現貨 日K：每 5 根一格（%y-%m-%d）；60K：每 10 小時一格
+    if mode == "spot":
+        _set_daily_ticks(ax_upper, df_upper_d, fmt=upper_fmt)
+    else:
+        _set_time_ticks(ax_upper, df_upper_d, interval_minutes=60, fmt=upper_fmt)
     _set_time_ticks(ax_60k, df_60k_d, interval_minutes=600)
 
     # ── MA lines — overlaid manually at integer x-positions ─────────────────
     for period, color, width in zip(_MA_PERIODS, _MA_COLORS, _MA_WIDTHS):
         col = f"MA{period}"
-        for ax, df_d in ((ax_5k, df_5k_d), (ax_60k, df_60k_d)):
+        for ax, df_d in ((ax_upper, df_upper_d), (ax_60k, df_60k_d)):
             s = df_d[col]
             if s.notna().any():
                 ax.plot(
@@ -261,23 +291,23 @@ def render_combined_chart(
                 )
 
     # ── Doji highlighting ───────────────────────────────────────────────────
-    _color_doji_candles(ax_5k,  df_5k_d)
-    _color_doji_candles(ax_60k, df_60k_d)
+    _color_doji_candles(ax_upper, df_upper_d)
+    _color_doji_candles(ax_60k,   df_60k_d)
 
     # ── 最高/最低價標注 ──────────────────────────────────────────────────────
-    _annotate_high_low(ax_5k,  df_5k_d)
-    _annotate_high_low(ax_60k, df_60k_d)
+    _annotate_high_low(ax_upper, df_upper_d)
+    _annotate_high_low(ax_60k,   df_60k_d)
 
     # ── Titles (置中，使用 NotoSansTC) ──────────────────────────────────────
     title_kw: dict = dict(loc="center", color="#e6edf3", fontsize=12, pad=8)
     if _FONT_PROPS is not None:
         title_kw["fontproperties"] = _FONT_PROPS
-    ax_5k.set_title(f"[{symbol}]  5K",  **title_kw)
-    ax_60k.set_title(f"[{symbol}]  60K", **title_kw)
+    ax_upper.set_title(f"[{symbol}]  {upper_label}", **title_kw)
+    ax_60k.set_title(f"[{symbol}]  60K",             **title_kw)
 
     # ── Global legend — 單行水平，放在兩圖縫隙中央偏下 ──────────────────────
     # hspace=0.60，height_ratios=[10,8] → 縫隙中心 ≈ Figure y 0.47；
-    # 往下移至 0.45 確保不壓到 5K 的 X 軸時間標籤。
+    # 往下移至 0.45 確保不壓到上圖的 X 軸時間標籤。
     handles = _build_legend_handles()
     leg = fig.legend(
         handles=handles,
@@ -374,7 +404,7 @@ def _apply_dark_style(ax) -> None:
     ax.yaxis.tick_right()
     ax.tick_params(axis="y", labelcolor=TICK)
 
-    # Horizontal grid lines (vertical added by _set_time_ticks)
+    # Horizontal grid lines (vertical added by _set_time_ticks / _set_daily_ticks)
     ax.yaxis.grid(True, linestyle="--", color=GRID, linewidth=0.7)
     ax.set_axisbelow(True)
 
@@ -451,6 +481,37 @@ def _set_time_ticks(
         step = max(1, len(df) // 8)
         positions = list(range(0, len(df), step))
         labels    = [df.index[i].strftime(fmt) for i in positions]
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, rotation=45, ha="right",
+                       fontsize=8, color="#8b949e")
+    # Vertical grid lines at every tick
+    ax.xaxis.grid(True, linestyle="--", color="#2a2a3e", linewidth=0.7)
+
+
+def _set_daily_ticks(
+    ax,
+    df:  pd.DataFrame,
+    fmt: str = "%y-%m-%d",
+) -> None:
+    """
+    Set x-axis ticks for daily-K bars.
+
+    Since daily bars have timestamps at midnight (no meaningful intraday
+    minute to modulo against), we instead place ticks at a fixed bar-count
+    interval so roughly 9 labels appear across the display window.
+
+    Parameters
+    ----------
+    ax  : The Axes object (mplfinance external-axes mode).
+    df  : Sliced daily display DataFrame (DatetimeIndex, tz-naive midnight).
+    fmt : strftime format — default "%y-%m-%d" for readability.
+    """
+    n    = len(df)
+    step = max(1, n // 9)   # ~9 刻度均勻分布
+
+    positions = list(range(0, n, step))
+    labels    = [df.index[i].strftime(fmt) for i in positions]
 
     ax.set_xticks(positions)
     ax.set_xticklabels(labels, rotation=45, ha="right",

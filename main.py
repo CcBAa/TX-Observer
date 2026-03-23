@@ -7,15 +7,23 @@ Supported symbols
   TSE/001 : 加權指數              (spot, Mon–Fri 09:00–13:30)
   OTC/101 : 櫃買指數              (spot, Mon–Fri 09:00–13:30)
 
-Scheduler design — trigger times (Asia/Taipei)
+Scheduler design — trigger times (Asia/Taipei)  ← all triggers fire at :10 s
 -----------------------------------------------
   ┌────────────────┬──────────────────────────────────────────────────────┐
-  │  Futures (TXF) │  Day : 08:45 09:45 10:45 11:45 12:45 13:45          │
-  │                │  Night (early) Mon–Fri : 15:00 … 23:00 (every hour) │
-  │                │  Night (late)  Tue–Sat : 00:00 … 05:00 (every hour) │
+  │  Futures (TXF) │  Day : 08:45:10  09:45:10 … 13:45:10                │
+  │                │  Night (early) Mon–Fri : 15:00:10 … 23:00:10        │
+  │                │  Night (late)  Tue–Sat : 00:00:10 … 05:00:10        │
   ├────────────────┼──────────────────────────────────────────────────────┤
-  │  Spot (TSE/OTC)│  09:00 10:00 11:00 12:00 13:00                      │
+  │  Spot (TSE/OTC)│  09:00:10  10:00:10  11:00:10  12:00:10  13:00:10   │
   └────────────────┴──────────────────────────────────────────────────────┘
+
+  The 10-second delay ensures the exchange has finished writing the just-
+  closed bar to the database before we query it.
+
+Chart modes
+-----------
+  Futures (TXFR1) : 5K  (90 bars, upper) + 60K (65 bars, lower)
+  Spot (TSE/OTC)  : 日K (45 bars, upper) + 60K (65 bars, lower)
 
 Error isolation
 ---------------
@@ -26,6 +34,8 @@ Shioaji login
 -------------
   The API singleton is initialized once at startup via fetcher.init_api().
   Individual job calls reuse the cached singleton — no re-login per task.
+  Token-expiry auto re-login is handled inside fetcher.py (up to 1 retry
+  per fetch call), covering cross-weekend session invalidation.
 """
 
 import argparse
@@ -36,6 +46,7 @@ from datetime import time as dtime
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -60,8 +71,10 @@ from renderer import render_combined_chart           # noqa: E402
 TW_TZ      = pytz.timezone("Asia/Taipei")
 CHARTS_DIR = Path("charts")
 
-_BARS_5K  = 400   # 1-min → 5K: 240 (MA240) + 120 (display) + buffer
-_BARS_60K = 350   # 1-min → 60K: 240 (MA240) + 80 (display) + buffer
+_BARS_5K  = 400     # 1-min → 5K: 240 (MA240) + 120 (display) + buffer
+_BARS_60K = 350     # 1-min → 60K: 240 (MA240) + 80 (display) + buffer
+_BARS_1MIN_FOR_DAILY = 20_000  # 1-min bars fetched for daily-K resample
+                                # 20000 ÷ 270 min/day ≈ 74 trading days ≫ 45
 
 # Symbols dispatched in each job
 _FUTURES_SYMBOLS: list[tuple[str, str]] = [
@@ -71,6 +84,9 @@ _SPOT_SYMBOLS: list[tuple[str, str]] = [
     ("TSE/001", "加權指數"),
     ("OTC/101", "櫃買指數"),
 ]
+
+# Spot symbols that use the 日K+60K chart mode
+_SPOT_SYMBOL_SET: frozenset[str] = frozenset(s for s, _ in _SPOT_SYMBOLS)
 
 # ---------------------------------------------------------------------------
 # Market state — updated at startup and daily at 08:30 by run_market_check()
@@ -202,16 +218,71 @@ def run_market_check() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Spot daily-K helper — resample 1-min data into daily bars
+# ---------------------------------------------------------------------------
+
+def _resample_spot_to_daily(df_1min: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate spot 1-min OHLCV bars into one daily bar per trading day.
+
+    The output index is the midnight timestamp of each trading date
+    (tz-aware Asia/Taipei), which renderer._prepare_dataframe() will later
+    convert to tz-naive for mplfinance.
+
+    Parameters
+    ----------
+    df_1min : DataFrame returned by fetcher.fetch_bars("1min", ...) for a
+              spot symbol.  "Datetime" is a column (tz-aware Asia/Taipei).
+
+    Returns
+    -------
+    DataFrame with columns: Datetime, Open, High, Low, Close, Volume.
+    """
+    df = df_1min.copy()
+    if "Datetime" in df.columns:
+        df = df.set_index("Datetime")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    # Group every bar from the same calendar date into one daily bar.
+    # normalize() floors tz-aware timestamps to midnight in their own tz,
+    # so each trading day's 09:00–13:30 bars collapse to one key.
+    date_keys = df.index.normalize()
+
+    df_daily = df.groupby(date_keys).agg(
+        Open=("Open",   "first"),
+        High=("High",   "max"),
+        Low=("Low",     "min"),
+        Close=("Close", "last"),
+        Volume=("Volume","sum"),
+    )
+    df_daily.index.name = "Datetime"
+    return df_daily.reset_index()
+
+
+# ---------------------------------------------------------------------------
 # Core job pipeline
 # ---------------------------------------------------------------------------
 
 def _run_symbol_job(symbol: str, display_name: str) -> None:
     """
     Complete pipeline for a single symbol:
-      fetch 5K + 60K  →  render combined chart  →  upload  →  LINE push
+
+    Futures (TXFR1)
+      fetch 5K + 60K  →  render 5K+60K chart  →  upload  →  LINE push
+
+    Spot (TSE/001 / OTC/101)
+      fetch 1min → resample to 日K
+      fetch 60K
+      →  render 日K+60K chart  →  upload  →  LINE push
 
     Errors are raised (not swallowed) so the caller can isolate them
     per-symbol without killing the scheduler.
+
+    Token-expiry auto re-login is handled transparently inside fetcher.py
+    (up to 1 retry per fetch call via _force_relogin()), so no additional
+    re-login logic is required here.
     """
     now = datetime.now(tz=TW_TZ)
     logger.info(
@@ -225,27 +296,57 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
         logger.error("[%s] Credential error — skipping: %s", display_name, exc)
         return
 
+    is_spot    = symbol in _SPOT_SYMBOL_SET
     chart_path: Optional[Path] = None
 
     try:
         fetcher = ShioajiDataFetcher(symbol)
 
-        logger.info("[%s] Fetching %d 5-min bars...", display_name, _BARS_5K)
-        df_5k = fetcher.fetch_bars("5min", bars=_BARS_5K)
+        if is_spot:
+            # ── 現貨模式：日K (上) + 60K (下) ──────────────────────────────
+            logger.info(
+                "[%s] Fetching %d 1-min bars for daily-K resample...",
+                display_name, _BARS_1MIN_FOR_DAILY,
+            )
+            df_1min  = fetcher.fetch_bars("1min", bars=_BARS_1MIN_FOR_DAILY)
+            df_upper = _resample_spot_to_daily(df_1min)
+            logger.info(
+                "[%s] Daily-K resample done: %d bars.", display_name, len(df_upper)
+            )
 
-        logger.info("[%s] Fetching %d 60-min bars...", display_name, _BARS_60K)
-        df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
+            logger.info("[%s] Fetching %d 60-min bars...", display_name, _BARS_60K)
+            df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
 
-        logger.info("[%s] Rendering combined 5K+60K chart...", display_name)
-        chart_path = render_combined_chart(df_5k, df_60k, display_name,
-                                           output_dir=CHARTS_DIR)
+            logger.info("[%s] Rendering combined 日K+60K chart...", display_name)
+            chart_path = render_combined_chart(
+                df_upper, df_60k, display_name,
+                output_dir=CHARTS_DIR,
+                mode="spot",
+            )
+            chart_desc = "日K + 60K 合圖"
+
+        else:
+            # ── 期貨模式：5K (上) + 60K (下) ───────────────────────────────
+            logger.info("[%s] Fetching %d 5-min bars...", display_name, _BARS_5K)
+            df_upper = fetcher.fetch_bars("5min", bars=_BARS_5K)
+
+            logger.info("[%s] Fetching %d 60-min bars...", display_name, _BARS_60K)
+            df_60k = fetcher.fetch_bars("60min", bars=_BARS_60K)
+
+            logger.info("[%s] Rendering combined 5K+60K chart...", display_name)
+            chart_path = render_combined_chart(
+                df_upper, df_60k, display_name,
+                output_dir=CHARTS_DIR,
+                mode="futures",
+            )
+            chart_desc = "5K + 60K 合圖"
 
         logger.info("[%s] Uploading chart to Imgbb...", display_name)
         image_url = upload_to_imgbb(chart_path, creds["IMGBB_API_KEY"])
 
-        # Price summary
-        latest = float(df_5k["Close"].iloc[-1])
-        prev   = float(df_5k["Close"].iloc[-2]) if len(df_5k) > 1 else latest
+        # Price summary — use upper-panel (most granular recent close)
+        latest = float(df_upper["Close"].iloc[-1])
+        prev   = float(df_upper["Close"].iloc[-2]) if len(df_upper) > 1 else latest
         chg    = latest - prev
         pct    = (chg / prev * 100.0) if prev else 0.0
         arrow  = "▲" if chg >= 0 else "▼"
@@ -262,7 +363,7 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
             f"{display_name} ({symbol})\n"
             f"Last:    {latest:>10,.0f}\n"
             f"Change:  {arrow} {abs(chg):.0f}  ({pct:+.2f}%)\n"
-            f"Charts:  5K + 60K 合圖"
+            f"Charts:  {chart_desc}"
         )
 
         logger.info("[%s] Sending LINE push...", display_name)
@@ -300,9 +401,9 @@ def _run_symbol_job(symbol: str, display_name: str) -> None:
 def run_futures_job() -> None:
     """
     Scheduled job for TXF futures (TXFR1).
-    Fires at: 08:45 09:45 10:45 11:45 12:45 13:45 (day)
-              15:00–23:00 every hour (night early)
-              00:00–05:00 every hour (night late)
+    Fires at: 08:45:10  09:45:10 … 13:45:10  (day)
+              15:00:10–23:00:10 every hour    (night early)
+              00:00:10–05:00:10 every hour    (night late)
     """
     if not _market_open_today:
         return   # already logged in run_market_check()
@@ -328,7 +429,7 @@ def run_futures_job() -> None:
 def run_spot_job() -> None:
     """
     Scheduled job for spot indices (TSE/001, OTC/101).
-    Fires at: 09:00 10:00 11:00 12:00 13:00 (Mon–Fri).
+    Fires at: 09:00:10  10:00:10  11:00:10  12:00:10  13:00:10  (Mon–Fri).
 
     Error isolation: if one index fails, the other still runs.
     """
@@ -362,15 +463,18 @@ def build_scheduler() -> BlockingScheduler:
     """
     Build a BlockingScheduler with cron triggers for all symbols.
 
+    All triggers fire at second=10 (10 s after the bar close) to ensure the
+    exchange database has fully committed the just-closed bar.
+
     Futures triggers (TXF)
     ──────────────────────
-    A. Day session     Mon–Fri  08:45 09:45 10:45 11:45 12:45 13:45
-    B. Night (early)   Mon–Fri  15:00 16:00 … 23:00
-    C. Night (late)    Tue–Sat  00:00 01:00 … 05:00
+    A. Day session     Mon–Fri  08:45:10  09:45:10 … 13:45:10
+    B. Night (early)   Mon–Fri  15:00:10  16:00:10 … 23:00:10
+    C. Night (late)    Tue–Sat  00:00:10  01:00:10 … 05:00:10
 
     Spot triggers (TSE/OTC)
     ───────────────────────
-    D. Day session     Mon–Fri  09:00 10:00 11:00 12:00 13:00
+    D. Day session     Mon–Fri  09:00:10  10:00:10 … 13:00:10
 
     misfire_grace_time=120 s allows catch-up if the host was briefly
     suspended (e.g. cloud VM live-migration).
@@ -382,60 +486,60 @@ def build_scheduler() -> BlockingScheduler:
     _common_spot    = dict(func=run_spot_job,    misfire_grace_time=120,
                            replace_existing=True)
 
-    # A. TXF day session
+    # A. TXF day session — fires 10 s after each :45 bar close
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour="8,9,10,11,12,13",
             minute=45,
-            second=0,
+            second=10,
             timezone=TW_TZ,
         ),
         id="txf_day",
-        name="TXF Day Session (08:45–13:45 on :45)",
+        name="TXF Day Session (08:45:10–13:45:10 on :45)",
     )
 
-    # B. TXF night session early (15:00–23:00)
+    # B. TXF night session early (15:00:10–23:00:10)
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour="15,16,17,18,19,20,21,22,23",
             minute=0,
-            second=0,
+            second=10,
             timezone=TW_TZ,
         ),
         id="txf_night_early",
-        name="TXF Night Session Early (15:00–23:00)",
+        name="TXF Night Session Early (15:00:10–23:00:10)",
     )
 
-    # C. TXF night session late (00:00–05:00, next calendar day)
+    # C. TXF night session late (00:00:10–05:00:10, next calendar day)
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
             day_of_week="tue-sat",
             hour="0,1,2,3,4,5",
             minute=0,
-            second=0,
+            second=10,
             timezone=TW_TZ,
         ),
         id="txf_night_late",
-        name="TXF Night Session Late (00:00–05:00)",
+        name="TXF Night Session Late (00:00:10–05:00:10)",
     )
 
-    # D. Spot indices (TSE/OTC)
+    # D. Spot indices (TSE/OTC) — fires 10 s after each :00 bar close
     scheduler.add_job(
         **_common_spot,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour="9,10,11,12,13",
             minute=0,
-            second=0,
+            second=10,
             timezone=TW_TZ,
         ),
         id="spot_day",
-        name="Spot Indices Day Session (09:00–13:00)",
+        name="Spot Indices Day Session (09:00:10–13:00:10)",
     )
 
     # E. Daily market-open check (08:30) — must fire before 08:45 futures job.
@@ -523,7 +627,7 @@ def main() -> None:
     scheduler = build_scheduler()
     logger.info(
         "Scheduler started (UTC+8). "
-        "Triggers: TXF day :45 | TXF night hourly | Spot 9–13:00. "
+        "Triggers: TXF day :45:10 | TXF night hourly :10s | Spot 9–13:00:10. "
         "Press Ctrl+C to stop."
     )
 
