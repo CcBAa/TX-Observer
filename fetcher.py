@@ -30,6 +30,12 @@ import pytz
 import shioaji as sj
 from dotenv import load_dotenv
 
+# 嘗試匯入 Shioaji 的 TokenError，以便精確捕獲 401 過期錯誤
+try:
+    from shioaji.error import TokenError as _SjTokenError
+except ImportError:
+    _SjTokenError = None  # type: ignore[assignment,misc]
+
 # pandas >= 1.1 replaced resample(base=) with resample(offset=)
 _PD_GTE_1_1 = tuple(int(x) for x in pd.__version__.split(".")[:2]) >= (1, 1)
 
@@ -205,6 +211,34 @@ def _logout(api: "sj.Shioaji") -> None:
         logger.info("Shioaji logout completed.")
     except Exception as exc:
         logger.warning("Shioaji logout warning: %s", exc)
+
+
+def _is_token_error(exc: Exception) -> bool:
+    """判斷例外是否為 Token 過期 / 401 認證失敗。"""
+    if _SjTokenError is not None and isinstance(exc, _SjTokenError):
+        return True
+    msg = str(exc).lower()
+    return "401" in msg or ("token" in msg and "expir" in msg)
+
+
+def _force_relogin() -> "sj.Shioaji":
+    """
+    強制重新建立 API 連線（跨週末或長時間閒置後 Token 過期時使用）。
+
+    清除舊的 singleton、嘗試登出舊 session，然後重新執行 login + fetch_contracts。
+    回傳新的 Shioaji 實例，後續所有任務均共用此新 singleton。
+    """
+    global _api
+    logger.warning("偵測到 Token 過期或連線中斷，執行自動重新登入...")
+    if _api is not None:
+        try:
+            _api.logout()
+        except Exception as exc:
+            logger.debug("重登入前舊 session 登出失敗（可忽略）: %s", exc)
+    _api = None
+    new_api = _get_api()
+    logger.info("自動重新登入成功，新 Token 已就緒。")
+    return new_api
 
 
 # ===========================================================================
@@ -577,27 +611,46 @@ class ShioajiDataFetcher:
             lookback      = math.ceil(trading_days * 7 / 5) + 10
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
-        api      = _get_api()
-        contract = self._get_contract(api)
-
         logger.info(
             "Fetching 1-min kbars: %s  %s → %s  (need ~%d 1-min bars for %d %s bars)",
             self._symbol, start, end, needed_1min, bars, timeframe,
         )
 
-        try:
-            kbars = api.kbars(contract, start=start, end=end)
-        except Exception as exc:
-            exc_str = str(exc).lower()
-            if "permission" in exc_str or "unauthorized" in exc_str or "403" in exc_str:
-                logger.error(
-                    "資料權限尚未開通！(%s)\n原始錯誤: %s", self._symbol, exc
-                )
-                raise PermissionError(
-                    f"Shioaji 資料權限不足 ({self._symbol}): {exc}"
+        # 最多允許一次自動重新登入（應對跨週末 Token 過期）
+        _MAX_RELOGIN = 1
+        kbars = None
+        for _attempt in range(_MAX_RELOGIN + 1):
+            api      = _get_api()
+            contract = self._get_contract(api)
+            try:
+                kbars = api.kbars(contract, start=start, end=end)
+                break   # 成功，跳出重試迴圈
+            except Exception as exc:
+                exc_str = str(exc).lower()
+
+                # Token 過期 (401) → 自動重新登入後重試一次
+                if _is_token_error(exc) and _attempt < _MAX_RELOGIN:
+                    logger.warning(
+                        "[%s] Token 過期 (401)，嘗試第 %d 次自動重新登入...",
+                        self._symbol, _attempt + 1,
+                    )
+                    _force_relogin()
+                    continue   # 回到迴圈頂端，使用新 api 重試
+
+                # 資料權限不足
+                if "permission" in exc_str or "unauthorized" in exc_str or "403" in exc_str:
+                    logger.error(
+                        "資料權限尚未開通！(%s)\n原始錯誤: %s", self._symbol, exc
+                    )
+                    raise PermissionError(
+                        f"Shioaji 資料權限不足 ({self._symbol}): {exc}"
+                    ) from exc
+
+                # 其他錯誤
+                logger.error("api.kbars() raised: %s", exc)
+                raise RuntimeError(
+                    f"Shioaji kbars fetch failed ({self._symbol}): {exc}"
                 ) from exc
-            logger.error("api.kbars() raised: %s", exc)
-            raise RuntimeError(f"Shioaji kbars fetch failed ({self._symbol}): {exc}") from exc
 
         # Normalise based on symbol type
         if self._is_spot:
