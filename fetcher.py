@@ -53,6 +53,7 @@ import atexit
 import logging
 import math
 import os
+import time as _time_mod
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
@@ -60,6 +61,17 @@ import pandas as pd
 import pytz
 import shioaji as sj
 from dotenv import load_dotenv
+
+# ===========================================================================
+# 全域時區硬化 — 必須在所有其他初始化之前執行
+# ===========================================================================
+# 在 UTC 伺服器上，os.environ["TZ"] 讓 C 層 localtime() / mktime() 也回傳
+# 台北時間，確保 Shioaji SDK 內部若有依賴 localtime 的邏輯都能對齊 CST。
+# config.py 的 setup_logging() 也會設定此值，但 fetcher 可能被單獨 import，
+# 因此在此處再次確認，保持冪等（idempotent）。
+os.environ.setdefault("TZ", "Asia/Taipei")
+if hasattr(_time_mod, "tzset"):
+    _time_mod.tzset()
 
 # Shioaji TokenError — used for precise 401 detection
 try:

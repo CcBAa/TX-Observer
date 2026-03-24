@@ -10,9 +10,24 @@ Responsibilities:
 import logging
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
+import pytz
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# 全域時區硬化 — 強制整個 process 使用 Asia/Taipei (UTC+8)
+# ---------------------------------------------------------------------------
+# os.environ["TZ"] 在 Linux/macOS 上讓 C 層的 localtime() 也返回台北時間，
+# 確保所有第三方套件（包含 logging 預設的 time.localtime）一致使用 CST。
+# Windows 不支援 time.tzset()，故以 hasattr 保護。
+os.environ["TZ"] = "Asia/Taipei"
+if hasattr(time, "tzset"):
+    time.tzset()
+
+_TW_TZ = pytz.timezone("Asia/Taipei")
 
 # ---------------------------------------------------------------------------
 # Load .env file (safe to call even if the file doesn't exist)
@@ -24,8 +39,24 @@ load_dotenv(dotenv_path=_env_path)
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-_LOG_FORMAT = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+_LOG_FORMAT = "%(asctime)s CST [%(levelname)-8s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+class _TaipeiFormatter(logging.Formatter):
+    """
+    Log formatter that always stamps records in Asia/Taipei time (UTC+8).
+
+    Python 預設的 logging.Formatter 用 time.localtime()，在 UTC 伺服器上
+    會輸出 UTC 時間戳。此 formatter 覆寫 formatTime()，強制轉換為台北時間，
+    確保 app.log 與終端機顯示的時間戳與台灣交易時間一致。
+    """
+
+    def formatTime(self, record: logging.LogRecord, datefmt: "str | None" = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=_TW_TZ)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime(_DATE_FORMAT)
 
 
 def setup_logging(log_file: str = "app.log") -> logging.Logger:
@@ -34,27 +65,30 @@ def setup_logging(log_file: str = "app.log") -> logging.Logger:
       1. StreamHandler  → stdout (visible in the terminal / systemd journal)
       2. FileHandler    → app.log (persistent record for headless server debugging)
 
+    All timestamps are formatted in Asia/Taipei time (UTC+8) via _TaipeiFormatter,
+    regardless of the server's system timezone.
+
     Call this exactly once in main.py before importing any other project module.
 
     Returns the 'tx_observer' logger that all sub-modules inherit from.
     """
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)   # 允許 DEBUG 訊息通過 root，由 handler 過濾
 
     # Avoid adding duplicate handlers if setup_logging() is called more than once
     if root_logger.handlers:
         return logging.getLogger("tx_observer")
 
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+    formatter = _TaipeiFormatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
-    # Console handler
+    # Console handler — INFO+ 至終端機（避免 DEBUG 雜訊淹沒操作輸出）
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    # File handler
+    # File handler — DEBUG+ 至 app.log（完整診斷紀錄，含停滯偵測 [DEBUG] 行）
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
     root_logger.addHandler(console_handler)

@@ -51,6 +51,7 @@ Shioaji login
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -62,6 +63,17 @@ import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+# ---------------------------------------------------------------------------
+# 全域時區硬化 — 必須在所有其他初始化之前執行（含 setup_logging 之前）
+# ---------------------------------------------------------------------------
+# UTC 伺服器上若不先設定 TZ，logging 的 %(asctime)s 與 datetime.now() 在
+# 未傳入 tz= 時都會輸出 UTC，導致凌晨日期計算偏移 8 小時。
+# os.environ["TZ"] 在 Linux 上搭配 time.tzset() 可讓整個 process 的 C 層
+# localtime() 也指向台北時間，是最徹底的修復方式。
+os.environ["TZ"] = "Asia/Taipei"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 try:
     import pandas_market_calendars as mcal
     _HAS_MCAL = True
@@ -72,7 +84,7 @@ from config import get_credentials, setup_logging
 
 logger = setup_logging()
 
-from fetcher import ShioajiDataFetcher, init_api   # noqa: E402
+from fetcher import ShioajiDataFetcher, init_api, _force_relogin, _get_api  # noqa: E402
 from notifier import send_push_message, upload_to_imgbb  # noqa: E402
 from renderer import render_combined_chart           # noqa: E402
 
@@ -95,6 +107,11 @@ _DISPLAY_DAILY = 45    # 現貨  日K  顯示根數
 _CLOSING_MAX_RETRIES = 3
 _CLOSING_RETRY_DELAY = 5.0   # seconds between retries
 
+# Initialization retry policy — covers IndexError / connection errors during
+# api.login() + api.fetch_contracts() at startup (e.g. during exchange settlement).
+_INIT_MAX_RETRIES = 5
+_INIT_RETRY_DELAY = 10.0   # seconds between initialization attempts
+
 # Symbols dispatched in each job
 _FUTURES_SYMBOLS: list[tuple[str, str]] = [
     ("TXFR1", "台指期近一"),
@@ -106,6 +123,86 @@ _SPOT_SYMBOLS: list[tuple[str, str]] = [
 
 # Spot symbols that use the 日K+60K chart mode
 _SPOT_SYMBOL_SET: frozenset[str] = frozenset(s for s, _ in _SPOT_SYMBOLS)
+
+# ---------------------------------------------------------------------------
+# Initialization with retry (合約抓取重試)
+# ---------------------------------------------------------------------------
+
+def _verify_contracts() -> None:
+    """
+    確認 fetch_contracts() 已成功載入 TXFR1 合約物件。
+
+    Shioaji 在交易所結算期間偶爾會回傳空白合約表；此函式在初始化成功後
+    立即驗證，若合約物件為 None 則拋出 RuntimeError，觸發上層重試邏輯。
+    """
+    api = _get_api()
+    txf_group = getattr(getattr(api.Contracts, "Futures", None), "TXF", None)
+    contract  = getattr(txf_group, "TXFR1", None) if txf_group is not None else None
+
+    if contract is None:
+        raise RuntimeError(
+            "TXFR1 合約物件為 None — fetch_contracts() 可能尚未完成或結算中。"
+        )
+    logger.info("合約驗證通過：TXFR1 合約物件已確認。")
+
+
+def _init_api_with_retry() -> None:
+    """
+    執行 Shioaji login + fetch_contracts，失敗時每隔 _INIT_RETRY_DELAY 秒自動重試，
+    最多重試 _INIT_MAX_RETRIES 次。
+
+    涵蓋場景
+    --------
+    - IndexError: list assignment index out of range（交易所結算期間 contracts 異常）
+    - 連線逾時 / Token 初始化失敗
+    - fetch_contracts 靜默成功但合約物件為空
+
+    每次重試前會呼叫 _force_relogin() 確保舊的 singleton 被清除，
+    避免帶著損壞的 session 重試。
+    """
+    last_exc: Exception = RuntimeError("未執行任何初始化嘗試")
+
+    for attempt in range(1, _INIT_MAX_RETRIES + 1):
+        try:
+            init_api()
+            _verify_contracts()
+            logger.info(
+                "Shioaji API 初始化成功（第 %d/%d 次嘗試）。",
+                attempt, _INIT_MAX_RETRIES,
+            )
+            return   # 成功 — 退出重試迴圈
+
+        except IndexError as exc:
+            last_exc = exc
+            logger.warning(
+                "[WARNING] 伺服器結算中或合約抓取異常，稍後將自動重試..."
+                " (第 %d/%d 次，錯誤: %s)",
+                attempt, _INIT_MAX_RETRIES, exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[WARNING] 伺服器結算中或合約抓取異常，稍後將自動重試..."
+                " (第 %d/%d 次，錯誤: %s)",
+                attempt, _INIT_MAX_RETRIES, exc,
+            )
+
+        if attempt < _INIT_MAX_RETRIES:
+            logger.info(
+                "等待 %.0f 秒後執行第 %d 次重新初始化...",
+                _INIT_RETRY_DELAY, attempt + 1,
+            )
+            # 清除損壞的 singleton，確保下一次 init_api() 重新建立連線
+            try:
+                _force_relogin()
+            except Exception:
+                pass   # 重置失敗無妨，_get_api() 會重新建立
+            time.sleep(_INIT_RETRY_DELAY)
+
+    raise RuntimeError(
+        f"Shioaji 初始化失敗，已重試 {_INIT_MAX_RETRIES} 次，最終錯誤: {last_exc}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Market state — updated at startup and daily at 08:30 by run_market_check()
@@ -718,13 +815,15 @@ def main() -> None:
         logger.error(str(exc))
         sys.exit(1)
 
-    # Initialize Shioaji API once — login happens here, not per-job
-    logger.info("Initializing Shioaji API (login once)...")
+    # Initialize Shioaji API once — login + contract fetch with auto-retry
+    logger.info(
+        "Initializing Shioaji API (最多重試 %d 次，間隔 %.0f 秒)...",
+        _INIT_MAX_RETRIES, _INIT_RETRY_DELAY,
+    )
     try:
-        init_api()
-        logger.info("Shioaji API ready.")
-    except Exception as exc:
-        logger.error("Shioaji initialization failed: %s", exc)
+        _init_api_with_retry()
+    except RuntimeError as exc:
+        logger.error("Shioaji 初始化最終失敗，程式中止: %s", exc)
         sys.exit(1)
 
     # Initialise the market-open flag immediately so the correct state is known
