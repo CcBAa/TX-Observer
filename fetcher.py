@@ -53,7 +53,7 @@ import atexit
 import logging
 import math
 import os
-from datetime import date, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -304,6 +304,146 @@ def _force_relogin() -> "sj.Shioaji":
     new_api = _get_api()
     logger.info("自動重新登入成功，新 Token 已就緒。")
     return new_api
+
+
+# ===========================================================================
+# Contract pre-warming (確保訂閱狀態為 Active)
+# ===========================================================================
+
+def _warm_contract(api: "sj.Shioaji", symbol: str) -> None:
+    """
+    在 api.kbars() 之前存取合約物件，確保 Shioaji 內部報價訂閱狀態為 Active。
+
+    對 TXFR1 存取 api.Contracts.Futures.TXF.TXFR1；
+    對現貨則存取對應的 Index 合約群組。
+    失敗時僅記錄 DEBUG，不拋出例外。
+    """
+    try:
+        if symbol == "TXFR1":
+            _ = api.Contracts.Futures.TXF.TXFR1
+            logger.debug("[%s] 合約預熱完成 (Futures.TXF.TXFR1)", symbol)
+        elif symbol in _SPOT_SYMBOLS:
+            market, code = _SPOT_SYMBOLS[symbol]
+            indexs_group = (
+                getattr(api.Contracts, "Indexs", None)
+                or getattr(api.Contracts, "Index", None)
+                or getattr(api.Contracts, "indexes", None)
+            )
+            if indexs_group:
+                mkt_grp = getattr(indexs_group, market, None)
+                if mkt_grp:
+                    _ = getattr(mkt_grp, code, None)
+                    logger.debug("[%s] 合約預熱完成 (Index.%s.%s)", symbol, market, code)
+    except Exception as exc:
+        logger.debug("[%s] 合約預熱失敗（非致命）: %s", symbol, exc)
+
+
+# ===========================================================================
+# Data stagnation diagnosis (資料停滯診斷)
+# ===========================================================================
+
+_STAGNATION_LAG_MINUTES = 10   # 超過此分鐘數則進行 Snapshot 對比
+
+
+def _validate_data_freshness(
+    api:      "sj.Shioaji",
+    symbol:   str,
+    df_1min:  pd.DataFrame,
+    is_spot:  bool,
+) -> None:
+    """
+    檢查最後一根 K 線時間是否落後當前時間超過 _STAGNATION_LAG_MINUTES 分鐘。
+
+    若落後超標，對 TXFR1 執行 Snapshot 對比：
+      邏輯 A — Snapshot 是新的，Kbars 是舊的：
+                → [ERROR]   Shioaji Kbars Server Lagging
+      邏輯 B — Snapshot 與 Kbars 皆為舊資料（或 Snapshot 取得失敗）：
+                → [WARNING] Detection of Data Stagnation. Attempting Session Reset...
+                → 立即執行 _force_relogin() 重置 Session
+
+    Debug 日誌（每次抓取皆輸出）：
+      [DEBUG] 品種: {symbol} | 最後 K 線時間: {ts} | 系統時間: {now} | 最新成交價: {close}
+    """
+    now_tw = datetime.now(TW_TZ)
+
+    # ── 取得最後一根 K 線資訊 ──────────────────────────────────────────────
+    if df_1min.empty:
+        logger.debug(
+            "[DEBUG] 品種: %s | 最後 K 線時間: N/A | 系統時間: %s | 最新成交價: N/A",
+            symbol, now_tw.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        )
+        return
+
+    if "Datetime" in df_1min.columns:
+        last_bar_ts = df_1min["Datetime"].iloc[-1]
+    else:
+        last_bar_ts = df_1min.index[-1]
+
+    if hasattr(last_bar_ts, "tzinfo") and last_bar_ts.tzinfo is None:
+        last_bar_ts = TW_TZ.localize(pd.Timestamp(last_bar_ts))
+    else:
+        last_bar_ts = pd.Timestamp(last_bar_ts)
+
+    last_close = float(df_1min["Close"].iloc[-1]) if "Close" in df_1min.columns else None
+
+    # ── 必輸出的 DEBUG 行 ─────────────────────────────────────────────────
+    logger.debug(
+        "[DEBUG] 品種: %s | 最後 K 線時間: %s | 系統時間: %s | 最新成交價: %s",
+        symbol,
+        last_bar_ts.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        now_tw.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        f"{last_close:.0f}" if last_close is not None else "N/A",
+    )
+
+    lag = now_tw - last_bar_ts
+    if lag <= pd.Timedelta(minutes=_STAGNATION_LAG_MINUTES):
+        return   # 資料新鮮，無需進一步診斷
+
+    # 現貨僅在日盤期間才有意義，夜間超時不診斷
+    if is_spot:
+        return
+
+    logger.warning(
+        "[%s] 最後 K 線 (%s) 落後系統時間 %s 超過 %d 分鐘，啟動 Snapshot 對比診斷...",
+        symbol,
+        last_bar_ts.strftime("%H:%M:%S"),
+        now_tw.strftime("%H:%M:%S"),
+        _STAGNATION_LAG_MINUTES,
+    )
+
+    # ── Snapshot 對比 ──────────────────────────────────────────────────────
+    snap_ts: "pd.Timestamp | None" = None
+    try:
+        contract = api.Contracts.Futures.TXF.TXFR1
+        snapshots = api.snapshots([contract])
+        if snapshots:
+            snap = snapshots[0]
+            raw_ts = getattr(snap, "ts", None) or getattr(snap, "datetime", None)
+            if raw_ts is not None:
+                snap_ts = pd.Timestamp(raw_ts)
+                if snap_ts.tzinfo is None:
+                    snap_ts = snap_ts.tz_localize("Asia/Taipei")
+    except Exception as exc:
+        logger.warning("[%s] Snapshot 取得失敗: %s", symbol, exc)
+
+    if snap_ts is not None and (now_tw - snap_ts) <= pd.Timedelta(minutes=_STAGNATION_LAG_MINUTES):
+        # 邏輯 A：Snapshot 新鮮，但 Kbars 是舊的 → Server Lag
+        logger.error(
+            "[ERROR] Shioaji Kbars Server Lagging - Kbars Data not matching Snapshots"
+            " | Snapshot 最新: %s | Kbars 最後: %s | 落後: %.1f 分鐘",
+            snap_ts.strftime("%H:%M:%S"),
+            last_bar_ts.strftime("%H:%M:%S"),
+            lag.total_seconds() / 60,
+        )
+    else:
+        # 邏輯 B：兩者皆舊（或 Snapshot 失敗）→ Session Expired
+        logger.warning(
+            "[WARNING] Detection of Data Stagnation. Attempting Session Reset..."
+            " | Kbars 最後: %s | Snapshot: %s",
+            last_bar_ts.strftime("%H:%M:%S"),
+            snap_ts.strftime("%H:%M:%S") if snap_ts is not None else "N/A",
+        )
+        _force_relogin()
 
 
 # ===========================================================================
@@ -757,14 +897,19 @@ class ShioajiDataFetcher:
         fetch_count = max(bars, tf_min_bars)
         needed_1min = int(fetch_count * min_per_bar * 1.5)
 
-        # ── Date range ──────────────────────────────────────────────────────
-        today = date.today()
+        # ── Date range（強制使用 Asia/Taipei 時區計算）──────────────────────
+        # 以 TW_TZ 當前時間為基準，確保跨午夜的夜盤資料不會因 UTC 日期偏移而漏抓。
+        # end_date  = 台北今天（不晚於明天）
+        # start_date = 最少回溯 2 天（保證夜盤完整），再依 MA buffer 往前延伸。
+        now_tw = datetime.now(TW_TZ)
+        today  = now_tw.date()
+
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
             mins_per_day = _SPOT_TRADING_MIN_PER_DAY if self._is_spot else _TRADING_MIN_PER_DAY
             trading_days = math.ceil(needed_1min / mins_per_day)
-            lookback     = math.ceil(trading_days * 7 / 5) + 10
+            lookback     = max(math.ceil(trading_days * 7 / 5) + 10, 2)   # 最少 2 天
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
@@ -782,6 +927,10 @@ class ShioajiDataFetcher:
         for _attempt in range(_MAX_RELOGIN + 1):
             api      = _get_api()
             contract = self._get_contract(api)
+
+            # ── 合約預熱：確保報價訂閱狀態為 Active ──────────────────────
+            _warm_contract(api, self._symbol)
+
             try:
                 kbars = api.kbars(contract, start=start, end=end)
                 break
@@ -824,6 +973,11 @@ class ShioajiDataFetcher:
             "Fetched %d 1-min bars from exchange (%s).",
             len(df_1min), self._symbol,
         )
+
+        # ── 資料停滯診斷（三層防禦）─────────────────────────────────────────
+        # 比較最後一根 1-min K 線時間與系統時間；超過 10 分鐘則進行
+        # Snapshot 對比，自動區分 Server Lag（邏輯 A）與 Session 失效（邏輯 B）。
+        _validate_data_freshness(api, self._symbol, df_1min, self._is_spot)
 
         # ── Resample ─────────────────────────────────────────────────────────
         if timeframe == "1min":
@@ -883,6 +1037,18 @@ class ShioajiDataFetcher:
             )
 
         self._latest_close = float(df_out["Close"].iloc[-1])
+
+        # ── 最終 DEBUG 彙總（無論成功與否皆輸出）─────────────────────────
+        _last_ts   = df_out["Datetime"].iloc[-1] if "Datetime" in df_out.columns else "N/A"
+        _now_final = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        _ts_str    = (
+            _last_ts.strftime("%Y-%m-%d %H:%M:%S %Z")
+            if hasattr(_last_ts, "strftime") else str(_last_ts)
+        )
+        logger.debug(
+            "[DEBUG] 品種: %s | 最後 K 線時間: %s | 系統時間: %s | 最新成交價: %.0f",
+            self._symbol, _ts_str, _now_final, self._latest_close,
+        )
         logger.info(
             "fetch_bars(%s, %s): returning %d bars (MA pre-computed) | "
             "latest close = %.0f",
