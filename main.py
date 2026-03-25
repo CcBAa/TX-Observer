@@ -128,75 +128,164 @@ _SPOT_SYMBOL_SET: frozenset[str] = frozenset(s for s, _ in _SPOT_SYMBOLS)
 # Initialization with retry (合約抓取重試)
 # ---------------------------------------------------------------------------
 
+def _contracts_ready() -> bool:
+    """
+    非拋出式快速檢查：確認所有必要標的（TXFR1 / TSE001 / OTC101）已成功載入。
+
+    因 pysolace 偶發 IndexError 而導致 fetch_contracts 提前中斷時，
+    必要合約可能已部分載入。此函式允許上層跳過不必要的重試，
+    直接以「合約是否夠用」作為初始化成功的判斷依據。
+
+    Returns
+    -------
+    True  — 三個必要合約物件均不為 None
+    False — 任一合約缺失，或例外發生
+    """
+    try:
+        api = _get_api()
+
+        # ── TXFR1 ──────────────────────────────────────────────────────────
+        txf_group = getattr(getattr(api.Contracts, "Futures", None), "TXF", None)
+        if getattr(txf_group, "TXFR1", None) is None:
+            logger.debug("_contracts_ready: TXFR1 未就緒")
+            return False
+
+        # ── 現貨 Index 群組 ─────────────────────────────────────────────────
+        idxs_group = None
+        for attr in ("Indexs", "Index", "indexes"):
+            idxs_group = getattr(api.Contracts, attr, None)
+            if idxs_group is not None:
+                break
+        if idxs_group is None:
+            logger.debug("_contracts_ready: Index 合約群組未就緒")
+            return False
+
+        # ── TSE/001 ─────────────────────────────────────────────────────────
+        tse_grp = getattr(idxs_group, "TSE", None)
+        if getattr(tse_grp, "TSE001", None) is None:
+            logger.debug("_contracts_ready: TSE001 未就緒")
+            return False
+
+        # ── OTC/101 ─────────────────────────────────────────────────────────
+        otc_grp = getattr(idxs_group, "OTC", None)
+        if getattr(otc_grp, "OTC101", None) is None:
+            logger.debug("_contracts_ready: OTC101 未就緒")
+            return False
+
+        return True
+
+    except Exception as exc:
+        logger.debug("_contracts_ready: 例外 — %s", exc)
+        return False
+
+
 def _verify_contracts() -> None:
     """
-    確認 fetch_contracts() 已成功載入 TXFR1 合約物件。
+    確認 fetch_contracts() 已成功載入所有必要合約物件。
 
     Shioaji 在交易所結算期間偶爾會回傳空白合約表；此函式在初始化成功後
     立即驗證，若合約物件為 None 則拋出 RuntimeError，觸發上層重試邏輯。
     """
-    api = _get_api()
-    txf_group = getattr(getattr(api.Contracts, "Futures", None), "TXF", None)
-    contract  = getattr(txf_group, "TXFR1", None) if txf_group is not None else None
-
-    if contract is None:
+    if not _contracts_ready():
         raise RuntimeError(
-            "TXFR1 合約物件為 None — fetch_contracts() 可能尚未完成或結算中。"
+            "必要合約（TXFR1 / TSE001 / OTC101）其中一或多個為 None — "
+            "fetch_contracts() 可能尚未完成或結算中。"
         )
-    logger.info("合約驗證通過：TXFR1 合約物件已確認。")
+    logger.info("合約驗證通過：TXFR1 / TSE001 / OTC101 均已確認。")
 
 
 def _init_api_with_retry() -> None:
     """
-    執行 Shioaji login + fetch_contracts，失敗時每隔 _INIT_RETRY_DELAY 秒自動重試，
-    最多重試 _INIT_MAX_RETRIES 次。
+    執行 Shioaji login + fetch_contracts，失敗時自動重試，最多 _INIT_MAX_RETRIES 次。
+
+    重試策略（三層遞進，避免無謂地銷毀 singleton）
+    ────────────────────────────────────────────────
+    層 1 — login 成功後直接檢查合約是否就緒（_contracts_ready）。
+           pysolace IndexError 已在 fetcher._create_and_login() 中靜默捕獲，
+           不會中斷登入流程；若合約已載入 → 直接成功，不重試。
+
+    層 2 — 合約不完整：在保留現有 session 的前提下，對 api 物件直接補呼叫
+           fetch_contracts()（輕量補抓），再次檢查合約。
+           IndexError 在此層亦被靜默捕獲。
+
+    層 3 — 輕量補抓後仍失敗：執行 _force_relogin()（清除 singleton），
+           讓下一輪迭代重新建立完整連線。
 
     涵蓋場景
     --------
-    - IndexError: list assignment index out of range（交易所結算期間 contracts 異常）
-    - 連線逾時 / Token 初始化失敗
-    - fetch_contracts 靜默成功但合約物件為空
-
-    每次重試前會呼叫 _force_relogin() 確保舊的 singleton 被清除，
-    避免帶著損壞的 session 重試。
+    - pysolace IndexError：第 1 層即可解決，不觸發重試。
+    - 結算期間合約空白：第 2 層輕量補抓；或第 3 層完整重試。
+    - 登入失敗 / Token 錯誤：直接進入第 3 層。
     """
     last_exc: Exception = RuntimeError("未執行任何初始化嘗試")
 
     for attempt in range(1, _INIT_MAX_RETRIES + 1):
+
+        # ── 層 1：Login + 直接驗證合約 ──────────────────────────────────────
         try:
             init_api()
-            _verify_contracts()
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[WARNING] API 登入失敗（第 %d/%d 次）: %s",
+                attempt, _INIT_MAX_RETRIES, exc,
+            )
+            # 登入本身失敗 → 必須完整重建 singleton
+            if attempt < _INIT_MAX_RETRIES:
+                logger.info("等待 %.0f 秒後執行第 %d 次重新初始化...",
+                            _INIT_RETRY_DELAY, attempt + 1)
+                try:
+                    _force_relogin()
+                except Exception:
+                    pass
+                time.sleep(_INIT_RETRY_DELAY)
+            continue
+
+        # Login 成功 — 確認合約是否已就緒（pysolace IndexError 已在 fetcher 內靜默）
+        if _contracts_ready():
             logger.info(
                 "Shioaji API 初始化成功（第 %d/%d 次嘗試）。",
                 attempt, _INIT_MAX_RETRIES,
             )
-            return   # 成功 — 退出重試迴圈
+            return
 
-        except IndexError as exc:
-            last_exc = exc
-            logger.warning(
-                "[WARNING] 伺服器結算中或合約抓取異常，稍後將自動重試..."
-                " (第 %d/%d 次，錯誤: %s)",
-                attempt, _INIT_MAX_RETRIES, exc,
+        # ── 層 2：合約不完整 — 輕量補抓（保留 session）─────────────────────
+        logger.info(
+            "[SYSTEM] 合約載入不完整，嘗試輕量補抓 fetch_contracts()..."
+            "（第 %d/%d 次）",
+            attempt, _INIT_MAX_RETRIES,
+        )
+        try:
+            _get_api().fetch_contracts()
+        except IndexError:
+            logger.info(
+                "[SYSTEM] 忽略非關鍵合約解析錯誤，繼續初始化..."
+                " (pysolace _fetch_contracts_cb IndexError)"
             )
         except Exception as exc:
-            last_exc = exc
-            logger.warning(
-                "[WARNING] 伺服器結算中或合約抓取異常，稍後將自動重試..."
-                " (第 %d/%d 次，錯誤: %s)",
-                attempt, _INIT_MAX_RETRIES, exc,
-            )
+            logger.warning("[SYSTEM] 輕量補抓合約失敗: %s", exc)
 
-        if attempt < _INIT_MAX_RETRIES:
+        if _contracts_ready():
             logger.info(
-                "等待 %.0f 秒後執行第 %d 次重新初始化...",
-                _INIT_RETRY_DELAY, attempt + 1,
+                "Shioaji API 初始化成功（輕量補抓後，第 %d/%d 次嘗試）。",
+                attempt, _INIT_MAX_RETRIES,
             )
-            # 清除損壞的 singleton，確保下一次 init_api() 重新建立連線
+            return
+
+        # ── 層 3：仍失敗 — 完整 relogin（下一輪從頭再來）──────────────────
+        last_exc = RuntimeError(
+            "必要合約（TXFR1 / TSE001 / OTC101）輕量補抓後仍不完整。"
+        )
+        logger.warning(
+            "[WARNING] 合約仍不完整，%.0f 秒後執行完整重新初始化..."
+            "（第 %d/%d 次）",
+            _INIT_RETRY_DELAY, attempt, _INIT_MAX_RETRIES,
+        )
+        if attempt < _INIT_MAX_RETRIES:
             try:
                 _force_relogin()
             except Exception:
-                pass   # 重置失敗無妨，_get_api() 會重新建立
+                pass
             time.sleep(_INIT_RETRY_DELAY)
 
     raise RuntimeError(

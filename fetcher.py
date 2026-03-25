@@ -298,6 +298,13 @@ def _create_and_login() -> "sj.Shioaji":
     try:
         api.fetch_contracts()
         logger.info("Shioaji fetch_contracts completed.")
+    except IndexError:
+        # pysolace _fetch_contracts_cb 在解析非核心合約時偶發 IndexError。
+        # 此錯誤不影響 TXFR1 / TSE / OTC 等必要標的的載入，可安全忽略。
+        logger.info(
+            "[SYSTEM] 忽略非關鍵合約解析錯誤，繼續初始化..."
+            " (pysolace _fetch_contracts_cb IndexError)"
+        )
     except Exception as exc:
         logger.warning("fetch_contracts 失敗，將嘗試直接存取合約: %s", exc)
 
