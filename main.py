@@ -232,22 +232,25 @@ def is_trading_time(dt: datetime, market: str = "futures") -> bool:
         return dtime(9, 0) <= t <= dtime(13, 30)
 
     # Futures (TXF)
-    _NIGHT_END   = dtime(5, 0)
+    # _NIGHT_END_GRACE extends the night-tail cutoff by 1 minute so that the
+    # 05:00:10 closing job (scheduled at second=10) is not rejected as "closed".
+    # Without this grace, dtime(5,0,10) > dtime(5,0) causes the job to be skipped.
+    _NIGHT_END_GRACE = dtime(5, 1)   # includes 05:00:xx; excludes 05:01+
     _DAY_START   = dtime(8, 45)
     _DAY_END     = dtime(13, 45)
     _NIGHT_START = dtime(15, 0)
 
     if weekday == 6:   # Sunday — always closed
         return False
-    if weekday == 5:   # Saturday — only 00:00–05:00 (Fri night tail)
-        return t < _NIGHT_END
+    if weekday == 5:   # Saturday — only 00:00–05:00:59 (Fri night tail)
+        return t < _NIGHT_END_GRACE
     if weekday == 0:   # Monday — no Sunday night session
         return _DAY_START <= t <= _DAY_END or t >= _NIGHT_START
 
     # Tuesday – Friday
-    if t < _NIGHT_END:                     # 00:00–05:00 night tail
+    if t < _NIGHT_END_GRACE:                  # 00:00–05:00:59 night tail
         return True
-    if _NIGHT_END <= t < _DAY_START:       # 05:00–08:44 closed
+    if _NIGHT_END_GRACE <= t < _DAY_START:    # 05:01–08:44 closed
         return False
     if _DAY_START <= t <= _DAY_END:        # 08:45–13:45 day session
         return True

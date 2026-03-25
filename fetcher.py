@@ -137,14 +137,12 @@ _MA_PERIODS_COMPUTE: list[int] = [5, 10, 20, 60, 240]
 # All other timeframes fall back to the default (300).
 _MA_BUFFER_PER_TF: dict[str, int] = {
     "1day":  300,
-    "60min": 500,
+    "60min": 400,   # 400 根足以支撐 MA240，大幅降低傳輸量（原 500）
     "5min":  300,
 }
 _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 
-# Approximate trading minutes per resampled bar — used to calculate how many
-# 1-min bars the API needs to cover for _MA_COMPUTE_MIN_BARS resampled bars.
-# "1day" uses the spot session length so the lookback covers enough days.
+# Approximate trading minutes per resampled bar — retained for "1min" path.
 _TIMEFRAME_MIN: dict[str, int] = {
     "1min":  1,
     "5min":  5,
@@ -153,6 +151,30 @@ _TIMEFRAME_MIN: dict[str, int] = {
     "30min": 30,
     "60min": 60,
     "1day":  _SPOT_TRADING_MIN_PER_DAY,   # ~270 min/trading day
+}
+
+# Approximate native bars per trading day — used for date-range lookback
+# calculation when fetching native-resolution kbars (no 1-min intermediate).
+_FUTURES_BARS_PER_DAY: dict[str, int] = {
+    "5min":  96,    # TXF 全盤 ~480 min / 5  ≈ 96 bars
+    "60min": 19,    # TXF: 5 日盤 (09:45–13:45) + 14 夜盤 (16:00–05:00)
+    "1day":  1,
+}
+_SPOT_BARS_PER_DAY: dict[str, int] = {
+    "5min":  54,    # 現貨 09:00–13:30 = 270 min / 5 = 54 bars
+    "60min": 5,     # 現貨: 10:00, 11:00, 12:00, 13:00, 13:30 = 5 bars
+    "1day":  1,
+}
+
+# Shioaji kbars native unit string — passed as unit= to api.kbars().
+# "1min" uses the default call (no unit param).
+_SJ_KBARS_UNIT: dict[str, str] = {
+    "5min":  "5min",
+    "10min": "10min",
+    "15min": "15min",
+    "30min": "30min",
+    "60min": "60min",
+    "1day":  "day",
 }
 
 
@@ -497,6 +519,52 @@ def _normalise(kbars) -> pd.DataFrame:
     df = df[session_mask.values]
     df = df[df["Volume"] > 0]
 
+    df = df.dropna(subset=["Close"]).sort_index()
+    df.index.name = "Datetime"
+    return df.reset_index()
+
+
+def _normalise_daily(kbars) -> pd.DataFrame:
+    """
+    Convert Shioaji native daily Kbars to a clean OHLCV DataFrame (spot index).
+
+    Unlike _normalise_spot(), this function does NOT apply intra-day session
+    time filtering — native daily bars from api.kbars(unit='day') already
+    represent one bar per trading day; their timestamps may be at midnight
+    which would be incorrectly rejected by the 09:00–13:30 spot session mask.
+
+    Timestamps are normalised to Asia/Taipei midnight for consistency with the
+    existing _resample_spot_to_daily() output format used by renderer.py.
+    """
+    df = pd.DataFrame({**kbars})
+    if df.empty:
+        return df
+
+    df.columns = [c.lower() for c in df.columns]
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    })
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Shioaji daily kbars missing columns: {missing}")
+
+    ts_col = df["ts"]
+    if pd.api.types.is_integer_dtype(ts_col):
+        dt_index = pd.to_datetime(ts_col, unit="ns").dt.tz_localize("Asia/Taipei")
+    else:
+        dt_index = pd.to_datetime(ts_col).dt.tz_localize("Asia/Taipei")
+
+    # Normalize to midnight so each bar represents one calendar date.
+    dt_index = dt_index.normalize()
+
+    df["Datetime"] = dt_index
+    df = df.set_index("Datetime")[required].copy()
+
+    if df["Volume"].sum() > 0:
+        df = df[df["Volume"] > 0]
     df = df.dropna(subset=["Close"]).sort_index()
     df.index.name = "Datetime"
     return df.reset_index()
@@ -899,42 +967,43 @@ class ShioajiDataFetcher:
                 f"  品種 {self._symbol} 為期貨，請使用 '5min' 或 '60min'。"
             )
 
-        min_per_bar = _TIMEFRAME_MIN[timeframe]
-
         # ── Buffer size for MA computation ──────────────────────────────────
         # Use the per-timeframe minimum defined in _MA_BUFFER_PER_TF so that
         # MA240 has a valid (non-NaN) tail value even for small display windows:
-        #   1day  → 300 bars   60min → 500 bars   5min → 300 bars
+        #   1day  → 300 bars   60min → 400 bars   5min → 300 bars
         tf_min_bars = _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS)
         fetch_count = max(bars, tf_min_bars)
-        needed_1min = int(fetch_count * min_per_bar * 1.5)
 
         # ── Date range（強制使用 Asia/Taipei 時區計算）──────────────────────
-        # 以 TW_TZ 當前時間為基準，確保跨午夜的夜盤資料不會因 UTC 日期偏移而漏抓。
-        # end_date  = 台北今天（不晚於明天）
-        # start_date = 最少回溯 2 天（保證夜盤完整），再依 MA buffer 往前延伸。
+        # 使用原生 K 線的每日 bar 數量直接推算回溯天數，大幅減少傳輸量。
+        # 例：60K buffer=400 根 → 400/19≈21 交易日 → ~30 日曆天
         now_tw = datetime.now(TW_TZ)
         today  = now_tw.date()
 
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            mins_per_day = _SPOT_TRADING_MIN_PER_DAY if self._is_spot else _TRADING_MIN_PER_DAY
-            trading_days = math.ceil(needed_1min / mins_per_day)
-            lookback     = max(math.ceil(trading_days * 7 / 5) + 10, 2)   # 最少 2 天
+            bars_per_day = (
+                _SPOT_BARS_PER_DAY.get(timeframe, 1)
+                if self._is_spot
+                else _FUTURES_BARS_PER_DAY.get(timeframe, 1)
+            )
+            trading_days = math.ceil(fetch_count / max(bars_per_day, 1))
+            lookback     = max(math.ceil(trading_days * 7 / 5) + 5, 3)   # 最少 3 天
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
-            "Fetching 1-min kbars: %s  %s → %s  "
-            "(target: %d %s display bars, fetch buffer: %d bars, ~%d 1-min bars)",
-            self._symbol, start, end,
-            bars, timeframe, fetch_count, needed_1min,
+            "Fetching native %s kbars: %s  %s → %s  "
+            "(target: %d display bars, buffer: %d bars)",
+            timeframe, self._symbol, start, end, bars, fetch_count,
         )
 
         # ── API call with Token-expiry retry ────────────────────────────────
         # Up to 2 re-login attempts to handle cross-weekend invalidation and
         # occasional double-expiry on long-running processes.
+        # _unit=None → default 1-min API call; otherwise native resolution.
         _MAX_RELOGIN = 2
+        _unit = _SJ_KBARS_UNIT.get(timeframe)   # e.g. "5min", "60min", "day"
         kbars = None
         for _attempt in range(_MAX_RELOGIN + 1):
             api      = _get_api()
@@ -944,7 +1013,10 @@ class ShioajiDataFetcher:
             _warm_contract(api, self._symbol)
 
             try:
-                kbars = api.kbars(contract, start=start, end=end)
+                if _unit is not None:
+                    kbars = api.kbars(contract, start=start, end=end, unit=_unit)
+                else:
+                    kbars = api.kbars(contract, start=start, end=end)
                 break
             except Exception as exc:
                 exc_str = str(exc).lower()
@@ -970,61 +1042,41 @@ class ShioajiDataFetcher:
                     f"Shioaji kbars fetch failed ({self._symbol}): {exc}"
                 ) from exc
 
-        # ── Normalise to 1-min DataFrame ────────────────────────────────────
-        if self._is_spot:
-            df_1min = _normalise_spot(kbars)
+        # ── Normalise to OHLCV DataFrame ────────────────────────────────────
+        # Native bars are already at target resolution — no resample needed.
+        # Dispatch to the correct normaliser based on timeframe and symbol type.
+        if timeframe == "1day":
+            df_out = _normalise_daily(kbars)        # no intra-day session filter
+        elif self._is_spot:
+            df_out = _normalise_spot(kbars)
         else:
-            df_1min = _normalise(kbars)
+            df_out = _normalise(kbars)
 
-        if df_1min.empty:
+        if df_out.empty:
             raise ValueError(
                 f"No kbar data returned for {self._symbol} ({start} → {end})"
             )
 
         logger.info(
-            "Fetched %d 1-min bars from exchange (%s).",
-            len(df_1min), self._symbol,
+            "Fetched %d native %s bars from exchange (%s).",
+            len(df_out), timeframe, self._symbol,
         )
 
         # ── 資料停滯診斷（三層防禦）─────────────────────────────────────────
-        # 比較最後一根 1-min K 線時間與系統時間；超過 10 分鐘則進行
+        # 比較最後一根 K 線時間與系統時間；超過 10 分鐘則進行
         # Snapshot 對比，自動區分 Server Lag（邏輯 A）與 Session 失效（邏輯 B）。
-        _validate_data_freshness(api, self._symbol, df_1min, self._is_spot)
+        _validate_data_freshness(api, self._symbol, df_out, self._is_spot)
 
-        # ── Resample ─────────────────────────────────────────────────────────
-        if timeframe == "1min":
-            df_out = df_1min
-
-        elif timeframe == "1day":
-            df_out = _resample_spot_to_daily(df_1min)
-            logger.info(
-                "Daily resample (%s): %d bars (from %d 1-min bars)",
-                self._symbol, len(df_out), len(df_1min),
-            )
-
-        elif timeframe == "60min":
-            if self._is_spot:
-                df_out = _resample_60min_spot(df_1min)
-            else:
-                df_out = _resample_60min(df_1min)
-            logger.info(
-                "60K resample (%s): %d bars (from %d 1-min bars)",
-                self._symbol, len(df_out), len(df_1min),
-            )
-
-        else:
-            if self._is_spot:
-                df_out = _resample_spot(df_1min, timeframe)
-            else:
-                df_out = _resample_session_aware(df_1min, timeframe)
-            logger.info(
-                "Session-aware resample → %s (%s): %d bars (from %d 1-min bars)",
-                timeframe, self._symbol, len(df_out), len(df_1min),
-            )
+        # ── Native bars — no resample required ──────────────────────────────
+        # API already returned bars at the requested resolution.
+        logger.info(
+            "Native bars ready: %s %s → %d bars (no resample required).",
+            self._symbol, timeframe, len(df_out),
+        )
 
         if df_out.empty:
             raise ValueError(
-                f"Resample to {timeframe} produced no bars for {self._symbol}"
+                f"No native {timeframe} bars available for {self._symbol}"
             )
 
         # ── MA pre-computation on full buffer ────────────────────────────────

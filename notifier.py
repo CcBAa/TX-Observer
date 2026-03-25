@@ -15,6 +15,7 @@ Billing note:
 
 import base64
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,8 @@ _IMGBB_UPLOAD_URL  = "https://api.imgbb.com/1/upload"
 _LINE_PUSH_URL     = "https://api.line.me/v2/bot/message/push"
 _REQUEST_TIMEOUT   = 30
 _LINE_TEXT_MAX_LEN = 5_000
+_IMGBB_MAX_RETRIES = 3
+_IMGBB_RETRY_DELAY = 5   # seconds between Imgbb upload retry attempts
 
 
 # ---------------------------------------------------------------------------
@@ -59,38 +62,62 @@ def upload_to_imgbb(image_path: Path, api_key: str) -> str:
     with image_path.open("rb") as f:
         image_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    try:
-        response = requests.post(
-            _IMGBB_UPLOAD_URL,
-            params={"key": api_key},
-            data={"image": image_b64},
-            timeout=_REQUEST_TIMEOUT,
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            f"Imgbb upload timed out after {_REQUEST_TIMEOUT}s for {image_path.name}"
-        )
-    except requests.exceptions.ConnectionError as exc:
-        raise RuntimeError(
-            f"Imgbb upload connection error for {image_path.name}: {exc}"
-        )
+    last_err: str = ""
+    for attempt in range(1, _IMGBB_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                _IMGBB_UPLOAD_URL,
+                params={"key": api_key},
+                data={"image": image_b64},
+                timeout=_REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as exc:
+            last_err = str(exc)
+            logger.warning(
+                "Imgbb upload attempt %d/%d failed (%s): %s",
+                attempt, _IMGBB_MAX_RETRIES, image_path.name, last_err,
+            )
+            if attempt < _IMGBB_MAX_RETRIES:
+                time.sleep(_IMGBB_RETRY_DELAY)
+            continue
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Imgbb upload failed for {image_path.name}: "
-            f"HTTP {response.status_code} — {response.text[:300]}"
+        if response.status_code != 200:
+            last_err = f"HTTP {response.status_code} — {response.text[:200]}"
+            logger.warning(
+                "Imgbb upload attempt %d/%d HTTP error (%s): %s",
+                attempt, _IMGBB_MAX_RETRIES, image_path.name, last_err,
+            )
+            if attempt < _IMGBB_MAX_RETRIES:
+                time.sleep(_IMGBB_RETRY_DELAY)
+            continue
+
+        try:
+            url: str = response.json()["data"]["url"]
+        except (KeyError, ValueError):
+            last_err = f"malformed response: {response.text[:200]}"
+            logger.warning(
+                "Imgbb upload attempt %d/%d bad response (%s): %s",
+                attempt, _IMGBB_MAX_RETRIES, image_path.name, last_err,
+            )
+            if attempt < _IMGBB_MAX_RETRIES:
+                time.sleep(_IMGBB_RETRY_DELAY)
+            continue
+
+        logger.info(
+            "Imgbb upload OK (attempt %d/%d): %s → %s",
+            attempt, _IMGBB_MAX_RETRIES, image_path.name, url,
         )
+        return url
 
-    try:
-        url: str = response.json()["data"]["url"]
-    except (KeyError, ValueError) as exc:
-        raise RuntimeError(
-            f"Imgbb response missing 'data.url' for {image_path.name}: "
-            f"{response.text[:300]}"
-        ) from exc
-
-    logger.info("Imgbb upload OK: %s → %s", image_path.name, url)
-    return url
+    # All retries exhausted — log a short warning and raise so caller can handle
+    logger.warning(
+        "Imgbb upload failed after %d attempts for %s: %s",
+        _IMGBB_MAX_RETRIES, image_path.name, last_err,
+    )
+    raise RuntimeError(
+        f"Imgbb upload failed after {_IMGBB_MAX_RETRIES} attempts "
+        f"({image_path.name}): {last_err}"
+    )
 
 
 # ---------------------------------------------------------------------------
