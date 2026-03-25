@@ -532,11 +532,8 @@ def _run_symbol_job(
         push_text = (
             closing_prefix
             + settlement_prefix
-            + f"[TX-Observer]  {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
-            f"{display_name} ({symbol})\n"
-            f"Last:    {latest:>10,.0f}\n"
-            f"Change:  {arrow} {abs(chg):.0f}  ({pct:+.2f}%)\n"
-            f"Charts:  {chart_desc}"
+            + f"{now.strftime('%Y-%m-%d %H:%M')} (UTC+8)\n"
+            f"{display_name} ({symbol})"
         )
 
         logger.info("[%s] Sending LINE push...", display_name)
