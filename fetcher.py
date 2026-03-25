@@ -136,9 +136,9 @@ _MA_PERIODS_COMPUTE: list[int] = [5, 10, 20, 60, 240]
 #
 # All other timeframes fall back to the default (300).
 _MA_BUFFER_PER_TF: dict[str, int] = {
-    "1day":  300,
-    "60min": 400,   # 400 根足以支撐 MA240，大幅降低傳輸量（原 500）
-    "5min":  300,
+    "1day":  300,   # 300 daily bars  ≈ 14 months  — MA240 日K
+    "60min": 300,   # 300 hourly bars ≈ 16 days TXF — MA240 需 240 根，再加 60 根緩衝
+    "5min":  300,   # 300 five-min bars ≈ 3–4 days  — MA240 5K
 }
 _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 
@@ -923,6 +923,113 @@ class ShioajiDataFetcher:
         self._symbol      = symbol
         self._is_spot     = symbol in _SPOT_SYMBOLS
         self._latest_close: "float | None" = None
+        # Per-instance 1-min bar cache.
+        # Stores the widest [start, end] date range fetched this job run.
+        # When a subsequent timeframe call (e.g. 5K after 60K) requests a
+        # narrower range, the data is sliced from the cache — no API call.
+        # Format: {"start": str, "end": str, "df": pd.DataFrame}
+        self._1min_cache: "dict | None" = None
+
+    # ------------------------------------------------------------------
+    # Internal 1-min fetch helper (cache + Token retry)
+    # ------------------------------------------------------------------
+
+    def _fetch_1min_raw(self, start: str, end: str) -> pd.DataFrame:
+        """
+        Fetch and normalise 1-min OHLCV bars for [start, end] with caching.
+
+        Cache behaviour
+        ---------------
+        The instance cache stores the widest date range fetched during this
+        job run.  When the requested range is a subset of the cached range
+        (e.g. the 5K call after the 60K call within the same job), the raw
+        1-min data is sliced from the cache — no additional API call.
+
+        When the requested range is wider than the cache (or the cache is
+        empty), a fresh API call is made and the cache is updated.
+
+        Token-expiry auto re-login
+        --------------------------
+        Up to 2 _force_relogin() retries — covers cross-weekend token
+        expiry and occasional double-expiry on long-running processes.
+        """
+        # ── Cache read ────────────────────────────────────────────────────
+        c = self._1min_cache
+        if c is not None and c["start"] <= start and c["end"] >= end:
+            logger.debug(
+                "[%s] 1-min cache HIT (cached %s→%s, requested %s→%s)",
+                self._symbol, c["start"], c["end"], start, end,
+            )
+            df = c["df"]
+            if "Datetime" in df.columns:
+                date_str = df["Datetime"].dt.strftime("%Y-%m-%d")
+                mask     = (date_str >= start) & (date_str <= end)
+                return df[mask].reset_index(drop=True)
+            return df
+
+        logger.debug(
+            "[%s] 1-min cache MISS (requesting %s→%s)", self._symbol, start, end,
+        )
+
+        # ── API call with Token-expiry retry ──────────────────────────────
+        _MAX_RELOGIN = 2
+        kbars = None
+        api   = None
+        for _attempt in range(_MAX_RELOGIN + 1):
+            api      = _get_api()
+            contract = self._get_contract(api)
+            _warm_contract(api, self._symbol)
+
+            try:
+                kbars = api.kbars(contract, start=start, end=end)
+                break
+            except Exception as exc:
+                exc_str = str(exc).lower()
+
+                if _is_token_error(exc) and _attempt < _MAX_RELOGIN:
+                    logger.warning(
+                        "[%s] Token 過期 (401)，嘗試第 %d/%d 次自動重新登入...",
+                        self._symbol, _attempt + 1, _MAX_RELOGIN,
+                    )
+                    _force_relogin()
+                    continue
+
+                if "permission" in exc_str or "unauthorized" in exc_str or "403" in exc_str:
+                    logger.error(
+                        "資料權限尚未開通！(%s)\n原始錯誤: %s", self._symbol, exc
+                    )
+                    raise PermissionError(
+                        f"Shioaji 資料權限不足 ({self._symbol}): {exc}"
+                    ) from exc
+
+                logger.error("api.kbars() raised: %s", exc)
+                raise RuntimeError(
+                    f"Shioaji kbars fetch failed ({self._symbol}): {exc}"
+                ) from exc
+
+        # ── Normalise to 1-min OHLCV DataFrame ────────────────────────────
+        if self._is_spot:
+            df_1min = _normalise_spot(kbars)
+        else:
+            df_1min = _normalise(kbars)
+
+        logger.info(
+            "Fetched %d 1-min bars from exchange (%s).",
+            len(df_1min), self._symbol,
+        )
+
+        # ── 資料停滯診斷（三層防禦）───────────────────────────────────────
+        _validate_data_freshness(api, self._symbol, df_1min, self._is_spot)
+
+        # ── Cache write（保留最寬的日期範圍）──────────────────────────────
+        if c is None or start <= c["start"]:
+            self._1min_cache = {"start": start, "end": end, "df": df_1min}
+            logger.debug(
+                "[%s] 1-min cache STORED (%s→%s, %d rows)",
+                self._symbol, start, end, len(df_1min),
+            )
+
+        return df_1min
 
     # ------------------------------------------------------------------
     # Primary public method
@@ -975,115 +1082,86 @@ class ShioajiDataFetcher:
             )
 
         # ── Buffer size for MA computation ──────────────────────────────────
-        # Use the per-timeframe minimum defined in _MA_BUFFER_PER_TF so that
-        # MA240 has a valid (non-NaN) tail value even for small display windows:
-        #   1day  → 300 bars   60min → 400 bars   5min → 300 bars
+        # fetch_count = max(display bars, MA buffer) so that MA240 always has
+        # a valid (non-NaN) tail value:
+        #   1day  → 300 daily bars   60min → 300 hourly bars   5min → 300 bars
         tf_min_bars = _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS)
         fetch_count = max(bars, tf_min_bars)
+        min_per_bar = _TIMEFRAME_MIN[timeframe]
+        # 1.5× margin: compensates for session gaps (lunch break, weekends,
+        # holidays) in the requested date window so we always get enough bars.
+        needed_1min = int(fetch_count * min_per_bar * 1.5)
 
         # ── Date range（強制使用 Asia/Taipei 時區計算）──────────────────────
-        # 使用原生 K 線的每日 bar 數量直接推算回溯天數，大幅減少傳輸量。
-        # 例：60K buffer=400 根 → 400/19≈21 交易日 → ~30 日曆天
+        # 以 TW_TZ 當前時間為基準，確保跨午夜夜盤不因 UTC 偏移而漏抓。
         now_tw = datetime.now(TW_TZ)
         today  = now_tw.date()
 
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            bars_per_day = (
-                _SPOT_BARS_PER_DAY.get(timeframe, 1)
-                if self._is_spot
-                else _FUTURES_BARS_PER_DAY.get(timeframe, 1)
-            )
-            trading_days = math.ceil(fetch_count / max(bars_per_day, 1))
-            lookback     = max(math.ceil(trading_days * 7 / 5) + 5, 3)   # 最少 3 天
+            mins_per_day = _SPOT_TRADING_MIN_PER_DAY if self._is_spot else _TRADING_MIN_PER_DAY
+            trading_days = math.ceil(needed_1min / mins_per_day)
+            lookback     = max(math.ceil(trading_days * 7 / 5) + 10, 2)
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
-            "Fetching native %s kbars: %s  %s → %s  "
-            "(target: %d display bars, buffer: %d bars)",
-            timeframe, self._symbol, start, end, bars, fetch_count,
+            "Fetching 1-min kbars: %s  %s → %s  "
+            "(target: %d %s bars, buffer: %d bars, ~%d 1-min bars)",
+            self._symbol, start, end,
+            bars, timeframe, fetch_count, needed_1min,
         )
 
-        # ── API call with Token-expiry retry ────────────────────────────────
-        # Up to 2 re-login attempts to handle cross-weekend invalidation and
-        # occasional double-expiry on long-running processes.
-        # _unit=None → default 1-min API call; otherwise native resolution.
-        _MAX_RELOGIN = 2
-        _unit = _SJ_KBARS_UNIT.get(timeframe)   # e.g. "5min", "60min", "day"
-        kbars = None
-        for _attempt in range(_MAX_RELOGIN + 1):
-            api      = _get_api()
-            contract = self._get_contract(api)
+        # ── 1-min bars（帶 instance-level 快取 + Token 重試）───────────────
+        # _fetch_1min_raw() 封裝了 API 重試、Normalise、停滯診斷、快取 R/W。
+        # 同一 job run 中第一次呼叫（通常是 60K，回溯較長）填入快取；
+        # 之後的 5K 呼叫（回溯較短）直接從快取切片，避免重複打 API。
+        df_1min = self._fetch_1min_raw(start, end)
 
-            # ── 合約預熱：確保報價訂閱狀態為 Active ──────────────────────
-            _warm_contract(api, self._symbol)
-
-            try:
-                if _unit is not None:
-                    kbars = api.kbars(contract, start=start, end=end, unit=_unit)
-                else:
-                    kbars = api.kbars(contract, start=start, end=end)
-                break
-            except Exception as exc:
-                exc_str = str(exc).lower()
-
-                if _is_token_error(exc) and _attempt < _MAX_RELOGIN:
-                    logger.warning(
-                        "[%s] Token 過期 (401)，嘗試第 %d/%d 次自動重新登入...",
-                        self._symbol, _attempt + 1, _MAX_RELOGIN,
-                    )
-                    _force_relogin()
-                    continue
-
-                if "permission" in exc_str or "unauthorized" in exc_str or "403" in exc_str:
-                    logger.error(
-                        "資料權限尚未開通！(%s)\n原始錯誤: %s", self._symbol, exc
-                    )
-                    raise PermissionError(
-                        f"Shioaji 資料權限不足 ({self._symbol}): {exc}"
-                    ) from exc
-
-                logger.error("api.kbars() raised: %s", exc)
-                raise RuntimeError(
-                    f"Shioaji kbars fetch failed ({self._symbol}): {exc}"
-                ) from exc
-
-        # ── Normalise to OHLCV DataFrame ────────────────────────────────────
-        # Native bars are already at target resolution — no resample needed.
-        # Dispatch to the correct normaliser based on timeframe and symbol type.
-        if timeframe == "1day":
-            df_out = _normalise_daily(kbars)        # no intra-day session filter
-        elif self._is_spot:
-            df_out = _normalise_spot(kbars)
-        else:
-            df_out = _normalise(kbars)
-
-        if df_out.empty:
+        if df_1min.empty:
             raise ValueError(
                 f"No kbar data returned for {self._symbol} ({start} → {end})"
             )
 
         logger.info(
-            "Fetched %d native %s bars from exchange (%s).",
-            len(df_out), timeframe, self._symbol,
+            "[%s] 1-min bars ready: %d rows (from cache or fresh fetch).",
+            self._symbol, len(df_1min),
         )
 
-        # ── 資料停滯診斷（三層防禦）─────────────────────────────────────────
-        # 比較最後一根 K 線時間與系統時間；超過 10 分鐘則進行
-        # Snapshot 對比，自動區分 Server Lag（邏輯 A）與 Session 失效（邏輯 B）。
-        _validate_data_freshness(api, self._symbol, df_out, self._is_spot)
+        # ── Resample ─────────────────────────────────────────────────────────
+        if timeframe == "1min":
+            df_out = df_1min
 
-        # ── Native bars — no resample required ──────────────────────────────
-        # API already returned bars at the requested resolution.
-        logger.info(
-            "Native bars ready: %s %s → %d bars (no resample required).",
-            self._symbol, timeframe, len(df_out),
-        )
+        elif timeframe == "1day":
+            df_out = _resample_spot_to_daily(df_1min)
+            logger.info(
+                "Daily resample (%s): %d bars (from %d 1-min bars)",
+                self._symbol, len(df_out), len(df_1min),
+            )
+
+        elif timeframe == "60min":
+            if self._is_spot:
+                df_out = _resample_60min_spot(df_1min)
+            else:
+                df_out = _resample_60min(df_1min)
+            logger.info(
+                "60K resample (%s): %d bars (from %d 1-min bars)",
+                self._symbol, len(df_out), len(df_1min),
+            )
+
+        else:
+            if self._is_spot:
+                df_out = _resample_spot(df_1min, timeframe)
+            else:
+                df_out = _resample_session_aware(df_1min, timeframe)
+            logger.info(
+                "Session-aware resample → %s (%s): %d bars (from %d 1-min bars)",
+                timeframe, self._symbol, len(df_out), len(df_1min),
+            )
 
         if df_out.empty:
             raise ValueError(
-                f"No native {timeframe} bars available for {self._symbol}"
+                f"Resample to {timeframe} produced no bars for {self._symbol}"
             )
 
         # ── MA pre-computation on full buffer ────────────────────────────────
