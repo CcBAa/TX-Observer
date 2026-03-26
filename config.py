@@ -59,7 +59,10 @@ class _TaipeiFormatter(logging.Formatter):
         return dt.strftime(_DATE_FORMAT)
 
 
-def setup_logging(log_file: str = "app.log") -> logging.Logger:
+_DEFAULT_LOG_FILE = str(Path(__file__).parent / "app.log")
+
+
+def setup_logging(log_file: str = _DEFAULT_LOG_FILE) -> logging.Logger:
     """
     Configure the root logger with two handlers:
       1. StreamHandler  → stdout (visible in the terminal / systemd journal)

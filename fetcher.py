@@ -166,29 +166,6 @@ _TIMEFRAME_MIN: dict[str, int] = {
     "1day":  _SPOT_TRADING_MIN_PER_DAY,   # ~270 min/trading day
 }
 
-# Approximate native bars per trading day — used for date-range lookback
-# calculation when fetching native-resolution kbars (no 1-min intermediate).
-_FUTURES_BARS_PER_DAY: dict[str, int] = {
-    "5min":  96,    # TXF 全盤 ~480 min / 5  ≈ 96 bars
-    "60min": 19,    # TXF: 5 日盤 (09:45–13:45) + 14 夜盤 (16:00–05:00)
-    "1day":  1,
-}
-_SPOT_BARS_PER_DAY: dict[str, int] = {
-    "5min":  54,    # 現貨 09:00–13:30 = 270 min / 5 = 54 bars
-    "60min": 5,     # 現貨: 10:00, 11:00, 12:00, 13:00, 13:30 = 5 bars
-    "1day":  1,
-}
-
-# Shioaji kbars native unit string — passed as unit= to api.kbars().
-# "1min" uses the default call (no unit param).
-_SJ_KBARS_UNIT: dict[str, str] = {
-    "5min":  "5min",
-    "10min": "10min",
-    "15min": "15min",
-    "30min": "30min",
-    "60min": "60min",
-    "1day":  "day",
-}
 
 
 # ===========================================================================
@@ -544,52 +521,6 @@ def _normalise(kbars) -> pd.DataFrame:
     return df.reset_index()
 
 
-def _normalise_daily(kbars) -> pd.DataFrame:
-    """
-    Convert Shioaji native daily Kbars to a clean OHLCV DataFrame (spot index).
-
-    Unlike _normalise_spot(), this function does NOT apply intra-day session
-    time filtering — native daily bars from api.kbars(unit='day') already
-    represent one bar per trading day; their timestamps may be at midnight
-    which would be incorrectly rejected by the 09:00–13:30 spot session mask.
-
-    Timestamps are normalised to Asia/Taipei midnight for consistency with the
-    existing _resample_spot_to_daily() output format used by renderer.py.
-    """
-    df = pd.DataFrame({**kbars})
-    if df.empty:
-        return df
-
-    df.columns = [c.lower() for c in df.columns]
-    df = df.rename(columns={
-        "open": "Open", "high": "High", "low": "Low",
-        "close": "Close", "volume": "Volume",
-    })
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing  = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Shioaji daily kbars missing columns: {missing}")
-
-    ts_col = df["ts"]
-    if pd.api.types.is_integer_dtype(ts_col):
-        dt_index = pd.to_datetime(ts_col, unit="ns").dt.tz_localize("Asia/Taipei")
-    else:
-        dt_index = pd.to_datetime(ts_col).dt.tz_localize("Asia/Taipei")
-
-    # Normalize to midnight so each bar represents one calendar date.
-    dt_index = dt_index.normalize()
-
-    df["Datetime"] = dt_index
-    df = df.set_index("Datetime")[required].copy()
-
-    if df["Volume"].sum() > 0:
-        df = df[df["Volume"] > 0]
-    df = df.dropna(subset=["Close"]).sort_index()
-    df.index.name = "Datetime"
-    return df.reset_index()
-
-
 def _normalise_spot(kbars) -> pd.DataFrame:
     """
     Convert Shioaji Kbars to a clean 1-min OHLCV DataFrame (spot index).
@@ -727,7 +658,7 @@ def _resample_spot(df_1min: pd.DataFrame, timeframe: str) -> pd.DataFrame:
             .agg(agg_rules)
         )
         resampled = resampled.dropna(how="all")
-        if df["Volume"].sum() > 0:
+        if block_df["Volume"].sum() > 0:
             resampled = resampled[resampled["Volume"] > 0]
         if not resampled.empty:
             blocks.append(resampled)
@@ -828,8 +759,7 @@ def _resample_60min_spot(df_1min: pd.DataFrame) -> pd.DataFrame:
         .agg(agg_rules)
         .dropna(how="all")
     )
-    if df["Volume"].sum() > 0:
-        df_out = df_out[df_out["Volume"] > 0]
+    df_out = df_out[df_out["Volume"] > 0]
 
     df_out.index.name = "Datetime"
     return df_out.sort_index().reset_index()
@@ -922,7 +852,7 @@ class ShioajiDataFetcher:
     -----------------------------------------
     fetch_bars() now:
       1. Fetches fetch_count = max(bars, _MA_BUFFER_PER_TF[timeframe]) bars.
-         (1day→300, 60min→500, 5min→300 — ensures MA240 is non-NaN at tail)
+         (1day→300, 60min→300, 5min→300 — ensures MA240 is non-NaN at tail)
       2. Computes MA5/10/20/60/240 on those fetch_count bars.
       3. Slices to the last *bars* rows.
       4. Returns the slice WITH MA columns attached.
@@ -1067,7 +997,7 @@ class ShioajiDataFetcher:
                     Internally, max(bars, _MA_BUFFER_PER_TF[timeframe]) bars
                     are fetched so that MA240 (年線) is always calculable:
                       "1day"  → buffer 300 bars  (display 45)
-                      "60min" → buffer 500 bars  (display 65)
+                      "60min" → buffer 300 bars  (display 65)
                       "5min"  → buffer 300 bars  (display 90)
         start     : Date string "yyyy-mm-dd".  Auto-derived if omitted.
         end       : Date string "yyyy-mm-dd".  Defaults to today.
@@ -1164,13 +1094,12 @@ class ShioajiDataFetcher:
                 f"Resample to {timeframe} produced no bars for {self._symbol}"
             )
 
-        # ── 釋放原始 1 分 K 大表格（Resample 已完成，不再需要）──────────────
-        # 同時清除 instance cache，讓 GC 可以即時回收百萬列大 DataFrame，
-        # 確保 renderer 執行期間不會因同時持有 1 分 K 和 matplotlib 緩衝而 OOM。
-        # （"1min" 除外：df_out 直接指向 df_1min，不可提前刪除）
-        if timeframe != "1min":
-            del df_1min
-            self._1min_cache = None
+        # ── 1-min 快取保留至本 job 結束（fetcher instance 被 GC 時一併釋放）──
+        # 對 spot 品種：第一次 fetch_bars("1day")（回溯 365 天）填入快取；
+        # 第二次 fetch_bars("60min")（回溯 30 天）可直接從快取切片，省去一次 API 呼叫。
+        # 對 futures 品種：5min（5 天）→ 60min（30 天）因 60min 範圍更寬，仍會重打 API，
+        # 快取對 futures 無額外效益，但也不造成問題。
+        # （"1min" 時 df_out 直接指向 df_1min，無需額外處理）
 
         # ── MA pre-computation on full buffer ────────────────────────────────
         # Set DatetimeIndex for rolling() to work correctly, compute MAs,
@@ -1279,26 +1208,3 @@ class ShioajiDataFetcher:
             )
         return contract
 
-
-# ===========================================================================
-# Backwards-compatible alias
-# ===========================================================================
-
-YFinanceDataFetcher = ShioajiDataFetcher
-
-
-# ===========================================================================
-# Standalone convenience function
-# ===========================================================================
-
-def fetch_data(
-    symbol:    str  = "TXFR1",
-    timeframe: str  = "5min",
-    bars:      int  = 90,
-    start:     "str | None" = None,
-    end:       "str | None" = None,
-) -> pd.DataFrame:
-    """Fetch K-line data for *symbol* at the given resolution (with MA columns)."""
-    return ShioajiDataFetcher(symbol).fetch_bars(
-        timeframe=timeframe, bars=bars, start=start, end=end
-    )

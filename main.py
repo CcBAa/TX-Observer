@@ -95,7 +95,7 @@ from renderer import render_combined_chart           # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 TW_TZ      = pytz.timezone("Asia/Taipei")
-CHARTS_DIR = Path("charts")
+CHARTS_DIR = Path(__file__).parent / "charts"
 
 # Display bars requested from fetcher.  fetcher.py internally fetches a larger
 # buffer (≥ _MA_COMPUTE_MIN_BARS = 500) for accurate MA computation, then slices
@@ -515,13 +515,6 @@ def _run_symbol_job(
 
         logger.info("[%s] Uploading chart to Imgbb...", display_name)
         image_url = upload_to_imgbb(chart_path, creds["IMGBB_API_KEY"])
-
-        # Price summary — use upper-panel (most granular recent close)
-        latest = float(df_upper["Close"].iloc[-1])
-        prev   = float(df_upper["Close"].iloc[-2]) if len(df_upper) > 1 else latest
-        chg    = latest - prev
-        pct    = (chg / prev * 100.0) if prev else 0.0
-        arrow  = "▲" if chg >= 0 else "▼"
 
         # Closing summary prefix — applied when this is an end-of-session job
         closing_prefix = "【今日收盤總結】\n" if closing_summary else ""

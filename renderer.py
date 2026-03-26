@@ -99,7 +99,7 @@ def _find_via_fc_list() -> "Path | None":
                 if p.exists() and _is_valid_font(p):
                     return p
         except Exception:
-            return None
+            continue
     return None
 
 
