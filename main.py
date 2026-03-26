@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Optional
 
 import pytz
+from apscheduler.executors.pool import ThreadPoolExecutor as _APSThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -738,7 +739,10 @@ def build_scheduler() -> BlockingScheduler:
     suspended (e.g. cloud VM live-migration).
     Closing jobs use misfire_grace_time=300 s for extra tolerance.
     """
-    scheduler = BlockingScheduler(timezone=TW_TZ)
+    scheduler = BlockingScheduler(
+        timezone=TW_TZ,
+        executors={"default": _APSThreadPoolExecutor(1)},  # 強制循序執行，避免兩 job 同時 render 導致 OOM
+    )
 
     _common_futures  = dict(func=run_futures_job,         misfire_grace_time=120,
                             replace_existing=True)
