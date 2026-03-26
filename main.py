@@ -11,24 +11,26 @@ Scheduler design — trigger times (Asia/Taipei)  ← all triggers fire at :10 s
 -----------------------------------------------
   ┌────────────────┬──────────────────────────────────────────────────────┐
   │  Futures (TXF) │  Day   : 08:45  09:45  10:45  11:45  12:45          │
-  │                │  Close : 13:45  (dedicated closing, retry×3)        │
+  │                │  Close : 13:45:10  (dedicated closing, retry×3)     │
   │                │  Night : 15:00  16:00  17:00  18:00  19:00  20:00   │
   │                │          21:00  22:00  23:00  (Mon–Fri)             │
-  │                │          00:00  01:00  02:00  03:00  04:00  05:00   │
-  │                │          (Tue–Sat, 05:00 = 夜盤收盤)                 │
+  │                │          00:00  01:00  02:00  03:00  04:00           │
+  │                │          (Tue–Sat)                                   │
+  │                │  NightClose : 05:00:10  (dedicated closing, retry×3)│
   ├────────────────┼──────────────────────────────────────────────────────┤
   │  Spot (TSE/OTC)│  Day   : 09:00  10:00  11:00  12:00  13:00          │
-  │                │  Close : 13:45  (dedicated closing, retry×3)        │
+  │                │  Close : 13:30:10  (dedicated closing, retry×3)     │
   │                │  (no night session)                                  │
   └────────────────┴──────────────────────────────────────────────────────┘
 
   The 10-second delay ensures the exchange has finished writing the just-
   closed bar to the database before we query it.
 
-  Closing summary jobs (13:45:10 for both futures and spot) are separate
-  dedicated triggers.  They fire with a "【今日收盤總結】" label in the
-  LINE push and retry up to 3 times (5-second gap) to handle late API
-  data delivery at session close.
+  Closing summary jobs use dedicated triggers with retry×3 (5-second gap)
+  to handle late API data delivery at session close.  They fire with a
+  "【今日收盤總結】" prefix in the LINE push.
+  Spot closing (13:30:10) and futures day closing (13:45:10) are staggered
+  by 15 minutes to prevent concurrent Resample / render OOM.
 
 Chart modes
 -----------
@@ -720,20 +722,21 @@ def build_scheduler() -> BlockingScheduler:
 
     Futures triggers (TXF)
     ──────────────────────
-    A. Day session (regular)  Mon–Fri  08:45  09:45  10:45  11:45  12:45
-    B. Futures closing        Mon–Fri  13:45:10  (dedicated, retry×3)
-    C. Night (early)          Mon–Fri  15:00  16:00  17:00  18:00  19:00
-                                        20:00  21:00  22:00  23:00
-    D. Night (late)           Tue–Sat  00:00  01:00  02:00  03:00  04:00  05:00
+    A. Day session (regular)   Mon–Fri  08:45  09:45  10:45  11:45  12:45
+    B. Day closing             Mon–Fri  13:45:10  (dedicated, retry×3)
+    C. Night (early)           Mon–Fri  15:00  16:00  17:00  18:00  19:00
+                                         20:00  21:00  22:00  23:00
+    D. Night (late, regular)   Tue–Sat  00:00  01:00  02:00  03:00  04:00
+    E. Night closing           Tue–Sat  05:00:10  (dedicated, retry×3)
 
     Spot triggers (TSE/OTC)
     ───────────────────────
-    E. Day session (regular)  Mon–Fri  09:00  10:00  11:00  12:00  13:00
-    F. Spot closing           Mon–Fri  13:45:10  (dedicated, retry×3)
+    F. Day session (regular)   Mon–Fri  09:00  10:00  11:00  12:00  13:00
+    G. Spot closing            Mon–Fri  13:30:10  (dedicated, retry×3)
 
     Other
     ─────
-    G. Daily market-open check  Mon–Sat  08:30:00
+    H. Daily market-open check  Mon–Sat  08:30:00
 
     misfire_grace_time=120 s allows catch-up if the host was briefly
     suspended (e.g. cloud VM live-migration).
@@ -797,22 +800,39 @@ def build_scheduler() -> BlockingScheduler:
         name="TXF Night Session Early (15:00:10–23:00:10)",
     )
 
-    # D. TXF night session late — every hour 00:00–05:00 (Tue–Sat).
-    #    Covers the cross-midnight tail through 05:00 夜盤收盤.
+    # D. TXF night session late (regular) — every hour 00:00–04:00 (Tue–Sat).
+    #    Hour 5 is intentionally excluded: 05:00 夜盤收盤 is handled by the
+    #    dedicated night-closing job (E) to enable retry + 【今日收盤總結】 push.
     scheduler.add_job(
         **_common_futures,
         trigger=CronTrigger(
             day_of_week="tue-sat",
-            hour="0,1,2,3,4,5",
+            hour="0,1,2,3,4",
             minute=0,
             second=10,
             timezone=TW_TZ,
         ),
         id="txf_night_late",
-        name="TXF Night Session Late (00:00:10–05:00:10)",
+        name="TXF Night Session Late (00:00:10–04:00:10)",
     )
 
-    # E. Spot indices (TSE/OTC) — fires 10 s after each :00 bar close
+    # E. TXF night closing — 05:00:10 (Tue–Sat), dedicated + retry×3.
+    #    Mirrors the day-session closing (B) but for the 夜盤 05:00 close.
+    scheduler.add_job(
+        func=run_futures_closing_job,
+        **_common_closing,
+        trigger=CronTrigger(
+            day_of_week="tue-sat",
+            hour=5,
+            minute=0,
+            second=10,
+            timezone=TW_TZ,
+        ),
+        id="txf_night_closing",
+        name="TXF Night Closing Summary (05:00:10)",
+    )
+
+    # F. Spot indices (TSE/OTC) — fires 10 s after each :00 bar close
     scheduler.add_job(
         **_common_spot,
         trigger=CronTrigger(
@@ -826,24 +846,25 @@ def build_scheduler() -> BlockingScheduler:
         name="Spot Indices Day Session (09:00:10–13:00:10)",
     )
 
-    # F. Spot closing summary — 13:45:10, with retry + 【今日收盤總結】 push.
-    #    Fires 15 minutes after the 13:30 spot close; 13:45 is shared with the
-    #    futures closing trigger (B) and both run concurrently without conflict.
+    # G. Spot closing summary — 13:30:10, with retry + 【今日收盤總結】 push.
+    #    Fires 10 s after the 13:30 spot market close.
+    #    Staggered 15 min before futures closing (B, 13:45:10) to prevent
+    #    concurrent Resample / render peaks and OOM.
     scheduler.add_job(
         func=run_spot_closing_job,
         **_common_closing,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour=13,
-            minute=45,
+            minute=30,
             second=10,
             timezone=TW_TZ,
         ),
         id="spot_closing",
-        name="Spot Closing Summary (13:45:10)",
+        name="Spot Closing Summary (13:30:10)",
     )
 
-    # G. Daily market-open check (08:30) — must fire before 08:45 futures job.
+    # H. Daily market-open check (08:30) — must fire before 08:45 futures job.
     #    mon-sat covers Saturday make-up sessions where the market reopens.
     #    misfire_grace_time=300 s so the check still runs after a brief VM resume.
     scheduler.add_job(
@@ -930,9 +951,9 @@ def main() -> None:
     scheduler = build_scheduler()
     logger.info(
         "Scheduler started (UTC+8). "
-        "TXF day: 08:45–12:45 + closing 13:45 | "
-        "TXF night: 15:00–23:00 + 00:00–05:00 (every hour) | "
-        "Spot: 09:00–13:00 + closing 13:45. "
+        "TXF day: 08:45–12:45 + closing 13:45:10 | "
+        "TXF night: 15:00–04:00 (hourly) + closing 05:00:10 | "
+        "Spot: 09:00–13:00 + closing 13:30:10. "
         "Press Ctrl+C to stop."
     )
 

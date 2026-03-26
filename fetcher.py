@@ -51,7 +51,6 @@ api.kbars() retries up to twice after _force_relogin() if a TokenError
 
 import atexit
 import logging
-import math
 import os
 import time as _time_mod
 from datetime import date, datetime, time as dtime, timedelta
@@ -141,6 +140,20 @@ _MA_BUFFER_PER_TF: dict[str, int] = {
     "5min":  300,   # 300 five-min bars ≈ 3–4 days  — MA240 5K
 }
 _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
+
+# Hard cap on calendar-day lookback per timeframe (OOM 防護).
+# 決定 _fetch_1min_raw() 最遠回溯幾個日曆日，確保單次抓取 1 分 K 列數
+# 絕對不超過 100 天（約 13 萬列），避免記憶體溢位被系統 Kill。
+#
+#   "1day"  365 天 → ~250 交易日 → 250 根日K (MA240 ✓)
+#   "60min"  30 天 → ~420 根 TXF 60K / ~105 根 TSE 60K (MA240 TXF ✓)
+#   "5min"    5 天 → ~384 根 TXF 5K (MA240 ✓)
+_MAX_LOOKBACK_DAYS: dict[str, int] = {
+    "1day":  365,   # 約 250 交易日，足以計算日線 MA240
+    "60min":  30,   # 約 380–420 根 TXF 60K，足以計算 MA240
+    "5min":    5,   # 約 384 根 TXF 5K，足以計算 MA240
+}
+_MAX_LOOKBACK_DAYS_DEFAULT: int = 30   # 其他時框的預設值
 
 # Approximate trading minutes per resampled bar — retained for "1min" path.
 _TIMEFRAME_MIN: dict[str, int] = {
@@ -1081,35 +1094,22 @@ class ShioajiDataFetcher:
                 f"  品種 {self._symbol} 為期貨，請使用 '5min' 或 '60min'。"
             )
 
-        # ── Buffer size for MA computation ──────────────────────────────────
-        # fetch_count = max(display bars, MA buffer) so that MA240 always has
-        # a valid (non-NaN) tail value:
-        #   1day  → 300 daily bars   60min → 300 hourly bars   5min → 300 bars
-        tf_min_bars = _MA_BUFFER_PER_TF.get(timeframe, _MA_COMPUTE_MIN_BARS)
-        fetch_count = max(bars, tf_min_bars)
-        min_per_bar = _TIMEFRAME_MIN[timeframe]
-        # 1.5× margin: compensates for session gaps (lunch break, weekends,
-        # holidays) in the requested date window so we always get enough bars.
-        needed_1min = int(fetch_count * min_per_bar * 1.5)
-
         # ── Date range（強制使用 Asia/Taipei 時區計算）──────────────────────
         # 以 TW_TZ 當前時間為基準，確保跨午夜夜盤不因 UTC 偏移而漏抓。
+        # start 依時框固定回溯天數（_MAX_LOOKBACK_DAYS），嚴格限制 1 分 K
+        # 抓取量，防止單次 fetch 超過 10 萬列導致 OOM Killed。
         now_tw = datetime.now(TW_TZ)
         today  = now_tw.date()
 
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            mins_per_day = _SPOT_TRADING_MIN_PER_DAY if self._is_spot else _TRADING_MIN_PER_DAY
-            trading_days = math.ceil(needed_1min / mins_per_day)
-            lookback     = max(math.ceil(trading_days * 7 / 5) + 10, 2)
+            lookback = _MAX_LOOKBACK_DAYS.get(timeframe, _MAX_LOOKBACK_DAYS_DEFAULT)
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
-            "Fetching 1-min kbars: %s  %s → %s  "
-            "(target: %d %s bars, buffer: %d bars, ~%d 1-min bars)",
-            self._symbol, start, end,
-            bars, timeframe, fetch_count, needed_1min,
+            "Fetching 1-min kbars: %s  %s → %s  (target: %d %s bars)",
+            self._symbol, start, end, bars, timeframe,
         )
 
         # ── 1-min bars（帶 instance-level 快取 + Token 重試）───────────────
@@ -1163,6 +1163,14 @@ class ShioajiDataFetcher:
             raise ValueError(
                 f"Resample to {timeframe} produced no bars for {self._symbol}"
             )
+
+        # ── 釋放原始 1 分 K 大表格（Resample 已完成，不再需要）──────────────
+        # 同時清除 instance cache，讓 GC 可以即時回收百萬列大 DataFrame，
+        # 確保 renderer 執行期間不會因同時持有 1 分 K 和 matplotlib 緩衝而 OOM。
+        # （"1min" 除外：df_out 直接指向 df_1min，不可提前刪除）
+        if timeframe != "1min":
+            del df_1min
+            self._1min_cache = None
 
         # ── MA pre-computation on full buffer ────────────────────────────────
         # Set DatetimeIndex for rolling() to work correctly, compute MAs,
