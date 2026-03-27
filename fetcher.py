@@ -129,27 +129,29 @@ _MA_PERIODS_COMPUTE: list[int] = [5, 10, 20, 60, 240]
 # Before slicing to the display window, fetch_bars() always fetches at least
 # this many *resampled* bars so that MA240 (年線) has a valid tail value:
 #
-#   "1day"  → 300 daily bars  ≈ 14 months  (display: 45)
-#   "60min" → 500 hourly bars ≈ 20 weeks   (display: 65)
-#   "5min"  → 300 5-min bars  ≈ 3–4 days   (display: 90)
+#   "1day"  → 340 daily bars  ≈ 500 cal-days  (display: 45)
+#   "60min" → 300 hourly bars ≈ 16 days TXF   (display: 65)
+#   "5min"  → 300 5-min bars  ≈ 3–4 days      (display: 90)
 #
 # All other timeframes fall back to the default (300).
 _MA_BUFFER_PER_TF: dict[str, int] = {
-    "1day":  300,   # 300 daily bars  ≈ 14 months  — MA240 日K
-    "60min": 300,   # 300 hourly bars ≈ 16 days TXF — MA240 需 240 根，再加 60 根緩衝
-    "5min":  300,   # 300 five-min bars ≈ 3–4 days  — MA240 5K
+    "1day":  340,   # 340 daily bars  ≈ 500 cal-days — MA240 日K + 100 根暖身緩衝
+    "60min": 300,   # 300 hourly bars ≈ 16 days TXF  — MA240 需 240 根，再加 60 根緩衝
+    "5min":  300,   # 300 five-min bars ≈ 3–4 days   — MA240 5K
 }
 _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 
 # Hard cap on calendar-day lookback per timeframe (OOM 防護).
 # 決定 _fetch_1min_raw() 最遠回溯幾個日曆日，確保單次抓取 1 分 K 列數
-# 絕對不超過 100 天（約 13 萬列），避免記憶體溢位被系統 Kill。
+# 不造成記憶體溢位。
 #
-#   "1day"  365 天 → ~250 交易日 → 250 根日K (MA240 ✓)
+#   "1day"  500 天 → ~340 交易日 → 340 根日K (MA240 + 100 根暖身緩衝 ✓)
+#             注意：1 分 K 在 resample 後立即釋放（del + cache clear），
+#             避免約 13.5 萬列的原始資料長駐記憶體。
 #   "60min"  30 天 → ~420 根 TXF 60K / ~105 根 TSE 60K (MA240 TXF ✓)
 #   "5min"    5 天 → ~384 根 TXF 5K (MA240 ✓)
 _MAX_LOOKBACK_DAYS: dict[str, int] = {
-    "1day":  365,   # 約 250 交易日，足以計算日線 MA240
+    "1day":  500,   # 約 340 交易日，確保 MA240 + 100 根緩衝；1 分 K resample 後立即釋放
     "60min":  30,   # 約 380–420 根 TXF 60K，足以計算 MA240
     "5min":    5,   # 約 384 根 TXF 5K，足以計算 MA240
 }
@@ -996,9 +998,11 @@ class ShioajiDataFetcher:
         bars      : Number of display bars to return (most recent N).
                     Internally, max(bars, _MA_BUFFER_PER_TF[timeframe]) bars
                     are fetched so that MA240 (年線) is always calculable:
-                      "1day"  → buffer 300 bars  (display 45)
+                      "1day"  → lookback 500 cal-days (~340 trading days, display 45)
                       "60min" → buffer 300 bars  (display 65)
                       "5min"  → buffer 300 bars  (display 90)
+                    For "1day": raw 1-min data (~135k rows) is released from memory
+                    immediately after resampling to avoid VPS OOM.
         start     : Date string "yyyy-mm-dd".  Auto-derived if omitted.
         end       : Date string "yyyy-mm-dd".  Defaults to today.
 
@@ -1064,9 +1068,15 @@ class ShioajiDataFetcher:
 
         elif timeframe == "1day":
             df_out = _resample_spot_to_daily(df_1min)
+            _raw_1min_count = len(df_1min)
+            # ── 記憶體安全：resample 完成後立即釋放原始 1 分 K 大表格 ──────────
+            # 500 天回溯產生約 13.5 萬列 1-min bars，MA 計算只需 daily df_out，
+            # 故在此明確清除 df_1min 變數與 instance cache，避免記憶體殘留。
+            del df_1min
+            self._1min_cache = None
             logger.info(
-                "Daily resample (%s): %d bars (from %d 1-min bars)",
-                self._symbol, len(df_out), len(df_1min),
+                "Daily resample (%s): %d bars (from %d 1-min bars) | 1-min cache cleared",
+                self._symbol, len(df_out), _raw_1min_count,
             )
 
         elif timeframe == "60min":
@@ -1109,6 +1119,14 @@ class ShioajiDataFetcher:
             df_out = df_out.set_index("Datetime")
 
         _compute_and_attach_ma(df_out, self._symbol, timeframe)
+
+        # ── Daily MA240 暖身資料確認 Log ─────────────────────────────────────
+        if timeframe == "1day" and "MA240" in df_out.columns:
+            ma240_valid = int(df_out["MA240"].notna().sum())
+            logger.info(
+                "[%s] Daily MA240 warming data count: %d (total daily bars: %d)",
+                self._symbol, ma240_valid, len(df_out),
+            )
 
         df_out = df_out.reset_index()   # Datetime back as column
 
