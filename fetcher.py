@@ -136,7 +136,8 @@ _MA_PERIODS_COMPUTE: list[int] = [5, 10, 20, 60, 240]
 # All other timeframes fall back to the default (300).
 _MA_BUFFER_PER_TF: dict[str, int] = {
     "1day":  340,   # 340 daily bars  ≈ 500 cal-days — MA240 日K + 100 根暖身緩衝
-    "60min": 300,   # 300 hourly bars ≈ 16 days TXF  — MA240 需 240 根，再加 60 根緩衝
+    "60min": 800,   # 800 hourly bars ≈ 42 days TXF (19 根/日) — MA240 + 560 根暖身緩衝
+                    # 現貨 60min 回溯 120 天約得 378 根，低於此目標值但 MA240 仍可完整計算
     "5min":  300,   # 300 five-min bars ≈ 3–4 days   — MA240 5K
 }
 _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
@@ -148,14 +149,21 @@ _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 #   "1day"  500 天 → ~340 交易日 → 340 根日K (MA240 + 100 根暖身緩衝 ✓)
 #             注意：1 分 K 在 resample 後立即釋放（del + cache clear），
 #             避免約 13.5 萬列的原始資料長駐記憶體。
-#   "60min"  30 天 → ~420 根 TXF 60K / ~105 根 TSE 60K (MA240 TXF ✓)
+#   "60min" → 見下方品種差異化常數（期貨 60 天 / 現貨 120 天）
 #   "5min"    5 天 → ~384 根 TXF 5K (MA240 ✓)
 _MAX_LOOKBACK_DAYS: dict[str, int] = {
     "1day":  500,   # 約 340 交易日，確保 MA240 + 100 根緩衝；1 分 K resample 後立即釋放
-    "60min":  30,   # 約 380–420 根 TXF 60K，足以計算 MA240
     "5min":    5,   # 約 384 根 TXF 5K，足以計算 MA240
 }
 _MAX_LOOKBACK_DAYS_DEFAULT: int = 30   # 其他時框的預設值
+
+# 60K 時框品種差異化回溯天數（日曆天）
+# TXFR1  ：全天盤每日 19 根，60 天 × ~42 交易日 = ~800 根 → MA240 完整計算 ✓
+#           1 分 K 約 28,800 列，resample 後保留於快取供後續 5K 呼叫使用
+# TSE/OTC：日盤每日 4.5 根，120 天 × ~84 交易日 = ~378 根 → MA240 完整計算 ✓
+#           1 分 K 約 22,680 列，resample 後本地變數即釋放（cache 已在 1day 後清除）
+_MAX_LOOKBACK_60MIN_FUTURES: int = 60
+_MAX_LOOKBACK_60MIN_SPOT:    int = 120
 
 # Approximate trading minutes per resampled bar — retained for "1min" path.
 _TIMEFRAME_MIN: dict[str, int] = {
@@ -999,10 +1007,12 @@ class ShioajiDataFetcher:
                     Internally, max(bars, _MA_BUFFER_PER_TF[timeframe]) bars
                     are fetched so that MA240 (年線) is always calculable:
                       "1day"  → lookback 500 cal-days (~340 trading days, display 45)
-                      "60min" → buffer 300 bars  (display 65)
+                      "60min" → TXFR1: 60 cal-days (~800 bars); TSE/OTC: 120 cal-days (~378 bars)
                       "5min"  → buffer 300 bars  (display 90)
                     For "1day": raw 1-min data (~135k rows) is released from memory
                     immediately after resampling to avoid VPS OOM.
+                    For "60min": local df_1min reference released after resample;
+                    futures cache retained for subsequent 5min call (cache HIT).
         start     : Date string "yyyy-mm-dd".  Auto-derived if omitted.
         end       : Date string "yyyy-mm-dd".  Defaults to today.
 
@@ -1038,7 +1048,13 @@ class ShioajiDataFetcher:
         if end is None:
             end = today.strftime("%Y-%m-%d")
         if start is None:
-            lookback = _MAX_LOOKBACK_DAYS.get(timeframe, _MAX_LOOKBACK_DAYS_DEFAULT)
+            if timeframe == "60min":
+                # 60K 回溯天數按品種差異化：
+                #   TXFR1 (期貨)：60 天 → ~800 根 → MA240 完整
+                #   TSE/OTC (現貨)：120 天 → ~378 根 → MA240 完整
+                lookback = _MAX_LOOKBACK_60MIN_SPOT if self._is_spot else _MAX_LOOKBACK_60MIN_FUTURES
+            else:
+                lookback = _MAX_LOOKBACK_DAYS.get(timeframe, _MAX_LOOKBACK_DAYS_DEFAULT)
             start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
@@ -1080,13 +1096,18 @@ class ShioajiDataFetcher:
             )
 
         elif timeframe == "60min":
+            _raw_1min_count = len(df_1min)
             if self._is_spot:
                 df_out = _resample_60min_spot(df_1min)
             else:
                 df_out = _resample_60min(df_1min)
+            # ── 記憶體安全：resample 完成後釋放本地 1-min 參照 ──────────────
+            # 期貨：self._1min_cache 仍保留資料供後續 5K 呼叫使用（cache HIT）
+            # 現貨：cache 於 1day resample 後已清除，del 可立即回收本次 22k 列
+            del df_1min
             logger.info(
                 "60K resample (%s): %d bars (from %d 1-min bars)",
-                self._symbol, len(df_out), len(df_1min),
+                self._symbol, len(df_out), _raw_1min_count,
             )
 
         else:
