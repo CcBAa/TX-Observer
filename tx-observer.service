@@ -1,44 +1,44 @@
 [Unit]
 Description=TX-Observer 台股自動監控系統 (TXFR1 / TSE / OTC)
-Documentation=https://github.com/yourname/tx-observer
-# 等待網路就緒再啟動，確保 Shioaji API 登入可成功
+Documentation=https://github.com/CcBAa/TX-Observer
+# 確保網路完全就緒再啟動，這對 Shioaji API 登入至關重要
 After=network-online.target
 Wants=network-online.target
+
+# ── 崩潰保護策略 ──────────────────────────────────────────────────────────
+# 限制短時間內連續崩潰重啟次數，避免無限重啟耗盡資源
+# 600 秒內最多允許重啟 10 次；超過後 systemd 會停止嘗試並報錯
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
 
-# ── 執行身份 ───────────────────────────────────────────────────────────────
-# 請將 User / Group 改為實際部署帳號，不建議以 root 執行
+# ── 執行身份 ──────────────────────────────────────────────────────────────
 User=ubuntu
 Group=ubuntu
 
-# ── 工作目錄與執行命令 ────────────────────────────────────────────────────
-# WorkingDirectory 請改為實際部署路徑
-WorkingDirectory=/opt/tx-observer
-ExecStart=/opt/tx-observer/venv/bin/python main.py
+# ── 工作目錄與執行命令 (已校正為你的實體路徑) ──────────────────────────────
+WorkingDirectory=/home/ubuntu/TX-Observer
+ExecStart=/home/ubuntu/TX-Observer/venv/bin/python main.py
 
-# ── 環境變數 ───────────────────────────────────────────────────────────────
+# ── 環境變數 ──────────────────────────────────────────────────────────────
 Environment="TZ=Asia/Taipei"
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONIOENCODING=utf-8"
 
-# ── 自動重啟策略 ───────────────────────────────────────────────────────────
-# Restart=always：無論因 OOM / 例外 / Killed 任何原因退出，10 秒後自動重啟
+# ── 自動重啟策略 ──────────────────────────────────────────────────────────
+# 無論因 OOM、程式 Exception 或被系統 Killed，15 秒後都會自動重啟
 Restart=always
-RestartSec=10
+RestartSec=15
 
-# 限制短時間內連續崩潰重啟次數，避免無限重啟耗盡資源
-# 300 秒內最多允許重啟 5 次；超過後 systemd 放棄並告警
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-# ── 資源保護 ───────────────────────────────────────────────────────────────
-# 給予 1.5 GB 記憶體上限，超過時由 systemd 而非 OS OOM Killer 終止
-# 終止後 Restart=always 仍會在 10 秒後重啟
+# ── 資源保護 (防止 VPS 整機當機) ──────────────────────────────────────────
+# 當記憶體達到 1.2GB 時，系統會開始施加壓力限制，若衝破 1.5GB 則由 systemd 強制重啟
+MemoryHigh=1200M
 MemoryMax=1536M
 MemorySwapMax=0
 
-# ── 日誌 ───────────────────────────────────────────────────────────────────
+# ── 日誌管理 ──────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tx-observer
