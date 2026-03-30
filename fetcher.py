@@ -158,12 +158,12 @@ _MAX_LOOKBACK_DAYS: dict[str, int] = {
 _MAX_LOOKBACK_DAYS_DEFAULT: int = 30   # 其他時框的預設值
 
 # 60K 時框品種差異化回溯天數（日曆天）
-# TXFR1  ：全天盤每日 19 根，60 天 × ~42 交易日 = ~800 根 → MA240 完整計算 ✓
-#           1 分 K 約 28,800 列，resample 後保留於快取供後續 5K 呼叫使用
-# TSE/OTC：日盤每日 4.5 根，120 天 × ~84 交易日 = ~378 根 → MA240 完整計算 ✓
-#           1 分 K 約 22,680 列，resample 後本地變數即釋放（cache 已在 1day 後清除）
-_MAX_LOOKBACK_60MIN_FUTURES: int = 60
-_MAX_LOOKBACK_60MIN_SPOT:    int = 120
+# TXFR1  ：全天盤每日 19 根，90 天 × ~63 交易日 = ~1197 根 → MA240 + 連假緩衝 ✓
+#           1 分 K 約 43,200 列，resample 後保留於快取供後續 5K 呼叫使用
+# TSE/OTC：日盤每日 4.5 根，150 天 × ~105 交易日 = ~472 根 → MA240 + 連假緩衝 ✓
+#           1 分 K 約 28,350 列，resample 後本地變數即釋放（cache 已在 1day 後清除）
+_MAX_LOOKBACK_60MIN_FUTURES: int = 90
+_MAX_LOOKBACK_60MIN_SPOT:    int = 150
 
 # Approximate trading minutes per resampled bar — retained for "1min" path.
 _TIMEFRAME_MIN: dict[str, int] = {
@@ -295,19 +295,8 @@ def _create_and_login() -> "sj.Shioaji":
         logger.error("Shioaji login failed: %s", exc)
         raise RuntimeError(f"Shioaji login failed: {exc}") from exc
 
-    try:
-        api.fetch_contracts()
-        logger.info("Shioaji fetch_contracts completed.")
-    except IndexError:
-        # pysolace _fetch_contracts_cb 在解析非核心合約時偶發 IndexError。
-        # 此錯誤不影響 TXFR1 / TSE / OTC 等必要標的的載入，可安全忽略。
-        logger.info(
-            "[SYSTEM] 忽略非關鍵合約解析錯誤，繼續初始化..."
-            " (pysolace _fetch_contracts_cb IndexError)"
-        )
-    except Exception as exc:
-        logger.warning("fetch_contracts 失敗，將嘗試直接存取合約: %s", exc)
-
+    # fetch_contracts() 已移除：改用隨用隨抓，避免全量抓取耗盡 CPU。
+    # 合約就緒驗證由 main.py 的 _init_api_with_retry() 負責。
     atexit.register(_logout, api)
     return api
 
@@ -1209,7 +1198,7 @@ class ShioajiDataFetcher:
         if indexs_group is None:
             raise RuntimeError(
                 f"無法找到 Index 合約群組。\n"
-                f"  請確認 Shioaji 版本並已成功 fetch_contracts()。\n"
+                f"  請確認 Shioaji 版本並已成功登入。\n"
                 f"  Symbol: {self._symbol}"
             )
 
@@ -1242,7 +1231,7 @@ class ShioajiDataFetcher:
             raise RuntimeError(
                 "無法取得 TXFR1 合約物件。\n"
                 f"  api.Contracts.Futures.TXF 下可見的合約: "
-                f"{futures_hint or '(空，可能需要先呼叫 fetch_contracts)'}\n"
+                f"{futures_hint or '(空)'}\n"
                 "  請確認 Shioaji 版本並已成功登入。"
             )
         return contract

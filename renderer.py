@@ -340,7 +340,7 @@ def render_combined_chart(
     handles = _build_legend_handles()
     leg = fig.legend(
         handles=handles,
-        ncol=len(handles),
+        ncol=5,           # MA5 / MA10 / MA20 / MA60 / MA240 固定 5 欄水平排列
         loc="center",
         bbox_to_anchor=(0.5, 0.45),
         frameon=False,
