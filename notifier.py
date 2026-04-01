@@ -199,14 +199,8 @@ def send_push_message(
         logger.info("LINE limit reached (HTTP 429) — push skipped.")
         return False
 
-    try:
-        err_body = response.json()
-        err_msg  = err_body.get("message", response.text[:300])
-    except ValueError:
-        err_msg = response.text[:300]
-
     logger.error(
-        "LINE Push failed: HTTP %d — %s", response.status_code, err_msg
+        "LINE Push failed: HTTP %d — %s", response.status_code, response.text
     )
     return False
 
