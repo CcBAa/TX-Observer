@@ -3,8 +3,9 @@ config.py — Configuration, security, and logging setup for TX-Observer.
 
 Responsibilities:
   - Load environment variables from .env via python-dotenv
-  - Validate all required credentials at startup
+  - Validate all required credentials at startup (ValueError on missing vars)
   - Configure the root logger to write to both stdout and app.log
+  - Expose Discord / Telegram credentials as module-level constants
 """
 
 import logging
@@ -20,9 +21,6 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # 全域時區硬化 — 強制整個 process 使用 Asia/Taipei (UTC+8)
 # ---------------------------------------------------------------------------
-# os.environ["TZ"] 在 Linux/macOS 上讓 C 層的 localtime() 也返回台北時間，
-# 確保所有第三方套件（包含 logging 預設的 time.localtime）一致使用 CST。
-# Windows 不支援 time.tzset()，故以 hasattr 保護。
 os.environ["TZ"] = "Asia/Taipei"
 if hasattr(time, "tzset"):
     time.tzset()
@@ -76,7 +74,7 @@ def setup_logging(log_file: str = _DEFAULT_LOG_FILE) -> logging.Logger:
     Returns the 'tx_observer' logger that all sub-modules inherit from.
     """
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)   # 允許 DEBUG 訊息通過 root，由 handler 過濾
+    root_logger.setLevel(logging.DEBUG)
 
     # Avoid adding duplicate handlers if setup_logging() is called more than once
     if root_logger.handlers:
@@ -84,12 +82,12 @@ def setup_logging(log_file: str = _DEFAULT_LOG_FILE) -> logging.Logger:
 
     formatter = _TaipeiFormatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
-    # Console handler — INFO+ 至終端機（避免 DEBUG 雜訊淹沒操作輸出）
+    # Console handler — INFO+ 至終端機
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    # File handler — DEBUG+ 至 app.log（完整診斷紀錄，含停滯偵測 [DEBUG] 行）
+    # File handler — DEBUG+ 至 app.log
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
@@ -106,32 +104,39 @@ def setup_logging(log_file: str = _DEFAULT_LOG_FILE) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Credential helpers
+# Credential validation & module-level constants
 # ---------------------------------------------------------------------------
 
 _REQUIRED_VARS = (
-    "LINE_CHANNEL_ACCESS_TOKEN",
-    "LINE_TARGET_ID",
-    "IMGBB_API_KEY",
+    # Discord Webhooks
+    "DISCORD_WEBHOOK_TSE",
+    "DISCORD_WEBHOOK_OTC",
+    "DISCORD_WEBHOOK_TX",
+    # Telegram Bot
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "TELEGRAM_THREAD_TSE",
+    "TELEGRAM_THREAD_OTC",
+    "TELEGRAM_THREAD_TX",
 )
 
 
-def get_credentials() -> dict[str, str]:
+def _load_and_validate() -> dict[str, str]:
     """
     Read and validate all required credentials from the environment.
 
     Returns a dict keyed by variable name.
 
     Raises:
-        EnvironmentError: If any required variable is missing or empty,
-                          halting the program with a clear diagnostic message.
+        ValueError: If any required variable is missing or empty,
+                    halting the program with a clear diagnostic message.
     """
     creds = {key: os.getenv(key, "").strip() for key in _REQUIRED_VARS}
     missing = [key for key, val in creds.items() if not val]
 
     if missing:
         bullet_list = "\n".join(f"    • {k}" for k in missing)
-        raise EnvironmentError(
+        raise ValueError(
             "\n"
             "  [TX-Observer] FATAL: The following environment variables are not configured:\n"
             f"{bullet_list}\n"
@@ -142,3 +147,19 @@ def get_credentials() -> dict[str, str]:
         )
 
     return creds
+
+
+# Validate at import time — process terminates immediately if any var is missing.
+_creds = _load_and_validate()
+
+# Discord Webhooks
+DISCORD_WEBHOOK_TSE: str = _creds["DISCORD_WEBHOOK_TSE"]
+DISCORD_WEBHOOK_OTC: str = _creds["DISCORD_WEBHOOK_OTC"]
+DISCORD_WEBHOOK_TX:  str = _creds["DISCORD_WEBHOOK_TX"]
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN:  str = _creds["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID:    str = _creds["TELEGRAM_CHAT_ID"]
+TELEGRAM_THREAD_TSE: str = _creds["TELEGRAM_THREAD_TSE"]
+TELEGRAM_THREAD_OTC: str = _creds["TELEGRAM_THREAD_OTC"]
+TELEGRAM_THREAD_TX:  str = _creds["TELEGRAM_THREAD_TX"]

@@ -84,12 +84,12 @@ try:
 except ImportError:
     _HAS_MCAL = False
 
-from config import get_credentials, setup_logging
+from config import setup_logging
 
 logger = setup_logging()
 
 from fetcher import ShioajiDataFetcher, init_api, _force_relogin, _get_api  # noqa: E402
-from notifier import send_push_message, upload_to_imgbb  # noqa: E402
+from notifier import notify_all  # noqa: E402
 from renderer import render_combined_chart           # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -127,6 +127,13 @@ _SPOT_SYMBOLS: list[tuple[str, str]] = [
 
 # Spot symbols that use the 日K+60K chart mode
 _SPOT_SYMBOL_SET: frozenset[str] = frozenset(s for s, _ in _SPOT_SYMBOLS)
+
+# Routing table — maps Shioaji symbol to notifier target_type
+_SYMBOL_TO_TARGET: dict[str, str] = {
+    "TXFR1":   "TX",
+    "TSE/001": "TSE",
+    "OTC/101": "OTC",
+}
 
 # ---------------------------------------------------------------------------
 # Initialization with retry (合約抓取重試)
@@ -376,12 +383,6 @@ def _run_symbol_job(
         display_name, now.strftime("%Y-%m-%d %H:%M:%S"),
     )
 
-    try:
-        creds = get_credentials()
-    except EnvironmentError as exc:
-        logger.error("[%s] Credential error — skipping: %s", display_name, exc)
-        return
-
     is_spot    = symbol in _SPOT_SYMBOL_SET
     chart_path: Optional[Path] = None
 
@@ -429,9 +430,6 @@ def _run_symbol_job(
             del df_upper, df_60k
             gc.collect()
 
-        logger.info("[%s] Uploading chart to Imgbb...", display_name)
-        image_url = upload_to_imgbb(chart_path, creds["IMGBB_API_KEY"])
-
         # Closing summary prefix — applied when this is an end-of-session job
         closing_prefix = "【今日收盤總結】\n" if closing_summary else ""
 
@@ -448,18 +446,10 @@ def _run_symbol_job(
             f"{display_name} ({symbol})"
         )
 
-        logger.info("[%s] Sending LINE push...", display_name)
-        success = send_push_message(
-            channel_access_token=creds["LINE_CHANNEL_ACCESS_TOKEN"],
-            target_id=creds["LINE_TARGET_ID"],
-            text=push_text,
-            image_url=image_url,
-        )
-
-        if success:
-            logger.info("[%s] Job completed successfully.", display_name)
-        else:
-            logger.warning("[%s] Job done — LINE push reported a failure.", display_name)
+        target_type = _SYMBOL_TO_TARGET[symbol]
+        logger.info("[%s] Sending notifications (Discord + Telegram)...", display_name)
+        notify_all(target_type=target_type, image_path=chart_path, message=push_text)
+        logger.info("[%s] Job completed successfully.", display_name)
 
     except Exception as exc:
         logger.error(
@@ -830,13 +820,8 @@ def main() -> None:
     logger.info("║          TX-Observer Starting        ║")
     logger.info("╚══════════════════════════════════════╝")
 
-    # Validate credentials before doing anything else
-    try:
-        get_credentials()
-        logger.info("All credentials loaded successfully.")
-    except EnvironmentError as exc:
-        logger.error(str(exc))
-        sys.exit(1)
+    # Credentials are validated at config import time (ValueError on missing vars).
+    logger.info("All credentials loaded successfully.")
 
     # Initialize Shioaji API once — login + 精準合約驗證（隨用隨抓）
     logger.info(
