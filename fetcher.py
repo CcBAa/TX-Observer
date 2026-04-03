@@ -372,7 +372,12 @@ def _warm_contract(api: "sj.Shioaji", symbol: str) -> None:
 # Data stagnation diagnosis (資料停滯診斷)
 # ===========================================================================
 
-_STAGNATION_LAG_MINUTES = 10   # 超過此分鐘數則進行 Snapshot 對比
+_STAGNATION_LAG_MINUTES  = 10   # 超過此分鐘數則進行 Snapshot 對比
+# 假日 / 休市守衛門檻：正常 Token 過期停滯通常在數分鐘以內；
+# 超過此閾值代表市場極可能處於休市狀態（假日、週末），不觸發 Session Reset。
+# 最長的正常交易間隔為夜盤收盤 05:00 → 隔日日盤開盤 08:45 = 3h45m，
+# 設定 4h 保留一段安全緩衝。
+_HOLIDAY_LAG_THRESHOLD   = pd.Timedelta(hours=4)
 
 
 def _validate_data_freshness(
@@ -431,6 +436,32 @@ def _validate_data_freshness(
 
     # 現貨僅在日盤期間才有意義，夜間超時不診斷
     if is_spot:
+        return
+
+    # ── 守衛一：時段守衛 ─────────────────────────────────────────────────────
+    # 當前時間若不在期貨交易時段內（08:45-13:45 日盤 / 15:00-05:00 夜盤），
+    # 資料落後是正常的收盤狀態，禁止觸發 Session Reset。
+    # 涵蓋情境：13:46-14:59 日夜盤間隙、05:01-08:44 夜盤收盤後至開盤前。
+    current_session = _get_trading_session(now_tw.time())
+    if current_session is None:
+        logger.debug(
+            "[%s] 當前 %s 非期貨交易時段（%s），略過停滯診斷。",
+            symbol, now_tw.strftime("%H:%M"), now_tw.strftime("%A"),
+        )
+        return
+
+    # ── 守衛二：假日 / 休市守衛 ──────────────────────────────────────────────
+    # 時間上雖落在夜盤窗口（15:00-05:00），但若最後一根 K 線距今超過
+    # _HOLIDAY_LAG_THRESHOLD（4 小時），代表今日夜盤根本未開盤（假日 / 特休），
+    # 禁止觸發 Session Reset，直接使用既有資料。
+    if lag > _HOLIDAY_LAG_THRESHOLD:
+        logger.info(
+            "[%s] 最後 K 線落後 %.1f 小時，超過休市守衛門檻（%d 小時）。"
+            "判斷為休市 / 假日，略過 Session Reset，使用既有資料。",
+            symbol,
+            lag.total_seconds() / 3600,
+            int(_HOLIDAY_LAG_THRESHOLD.total_seconds() // 3600),
+        )
         return
 
     logger.warning(
