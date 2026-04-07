@@ -391,13 +391,18 @@ def _run_symbol_job(
 
         if is_spot:
             # ── 現貨模式：日K (上, 45根) + 60K (下, 65根) ───────────────────
-            # fetcher 內部抓取 ≥300 根日K 計算 MA240，切片後傳回 _DISPLAY_DAILY 根。
             logger.info("[%s] Fetching %d daily bars (with MA buffer)...",
                         display_name, _DISPLAY_DAILY)
             df_upper = fetcher.fetch_bars("1day",  bars=_DISPLAY_DAILY)
+            # 注意：1day 路徑內部已清除 1-min cache（~13.5萬列），無需再次清除。
 
             logger.info("[%s] Fetching %d 60-min bars...", display_name, _DISPLAY_60K)
             df_60k = fetcher.fetch_bars("60min", bars=_DISPLAY_60K)
+
+            # ── render 前清除 60min 的 1-min cache（≈28k 列），避免 render 時 OOM ──
+            fetcher._1min_cache = None
+            del fetcher
+            gc.collect()
 
             logger.info("[%s] Rendering combined 日K+60K chart...", display_name)
             chart_path = render_combined_chart(
@@ -406,27 +411,31 @@ def _run_symbol_job(
                 mode="spot",
             )
             chart_desc = "日K + 60K 合圖"
-            # ── 渲染完成後立即釋放 DataFrame，降低 1.5GB VPS 記憶體壓力 ──────
             del df_upper, df_60k
             gc.collect()
 
         else:
             # ── 期貨模式：60K (上, 65根) + 5K (下, 90根) ────────────────────
-            # fetcher 內部抓取 ≥300 根計算 MA240，切片後傳回目標根數。
-            logger.info("[%s] Fetching %d 5-min bars...", display_name, _DISPLAY_5K)
-            df_upper = fetcher.fetch_bars("5min",  bars=_DISPLAY_5K)
-
+            # 先抓 60K（填入 1-min cache ≈61k 列），再抓 5K（cache HIT 切片），
+            # 然後立即清除 cache，確保 ~61k 列在 render 前完全釋放。
             logger.info("[%s] Fetching %d 60-min bars...", display_name, _DISPLAY_60K)
             df_60k = fetcher.fetch_bars("60min", bars=_DISPLAY_60K)
 
-            logger.info("[%s] Rendering combined 5K+60K chart...", display_name)
+            logger.info("[%s] Fetching %d 5-min bars...", display_name, _DISPLAY_5K)
+            df_upper = fetcher.fetch_bars("5min",  bars=_DISPLAY_5K)
+
+            # ── render 前釋放 1-min cache（≈61k 列），避免 render 時 OOM ─────
+            fetcher._1min_cache = None
+            del fetcher
+            gc.collect()
+
+            logger.info("[%s] Rendering combined 60K+5K chart...", display_name)
             chart_path = render_combined_chart(
                 df_upper, df_60k, display_name,
                 output_dir=CHARTS_DIR,
                 mode="futures",
             )
             chart_desc = "5K + 60K 合圖"
-            # ── 渲染完成後立即釋放 DataFrame，降低 1.5GB VPS 記憶體壓力 ──────
             del df_upper, df_60k
             gc.collect()
 

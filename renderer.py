@@ -355,6 +355,7 @@ def render_combined_chart(
 
     # ── Save ─────────────────────────────────────────────────────────────────
     fig.savefig(str(filepath), dpi=300, bbox_inches="tight", facecolor="#0d1117")
+    fig.clf()           # 清除 figure 內所有 axes / artists，釋放 Agg raster buffer
     plt.close(fig)
     plt.close("all")   # 清除所有殘留 figure 物件（防止 mplfinance 內部 figure 洩漏）
     gc.collect()        # 強制回收 Agg 大型 raster buffer，避免 render 後記憶體殘留

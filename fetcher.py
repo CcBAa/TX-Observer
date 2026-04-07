@@ -50,6 +50,7 @@ api.kbars() retries up to twice after _force_relogin() if a TokenError
 """
 
 import atexit
+import gc
 import logging
 import os
 import time as _time_mod
@@ -1125,6 +1126,7 @@ class ShioajiDataFetcher:
             # 期貨：self._1min_cache 仍保留資料供後續 5K 呼叫使用（cache HIT）
             # 現貨：cache 於 1day resample 後已清除，del 可立即回收本次 22k 列
             del df_1min
+            gc.collect()   # 立即回收 ~61k 列 1-min 大表格的暫存副本
             logger.info(
                 "60K resample (%s): %d bars (from %d 1-min bars)",
                 self._symbol, len(df_out), _raw_1min_count,
@@ -1174,7 +1176,9 @@ class ShioajiDataFetcher:
         # ── Slice to display window ──────────────────────────────────────────
         # MA is already correct at the tail; now trim to the requested bars.
         if len(df_out) > bars:
-            df_out = df_out.iloc[-bars:].reset_index(drop=True)
+            # .copy() 確保返回的小 slice（65/90 根）與原本大 buffer（800+ 根）
+            # 完全切斷記憶體連結，讓 GC 可以立即回收大 buffer。
+            df_out = df_out.iloc[-bars:].copy()
 
         if df_out.empty:
             raise ValueError(
