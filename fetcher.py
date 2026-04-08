@@ -154,9 +154,23 @@ _MA_COMPUTE_MIN_BARS: int = 300   # fallback for unlisted timeframes
 #   "5min"    5 天 → ~384 根 TXF 5K (MA240 ✓)
 _MAX_LOOKBACK_DAYS: dict[str, int] = {
     "1day":  500,   # 約 340 交易日，確保 MA240 + 100 根緩衝；1 分 K resample 後立即釋放
-    "5min":    5,   # 約 384 根 TXF 5K，足以計算 MA240
+    "5min":    5,   # Spot 5K 現貨備用值；TXFR1 期貨 5K 改用下方 _MAX_LOOKBACK_HOURS_5MIN_FUTURES
 }
 _MAX_LOOKBACK_DAYS_DEFAULT: int = 30   # 其他時框的預設值
+
+# TXF 期貨 5K 夜盤跨日回溯（以小時計，錨定於「當前時刻」而非「今天午夜」）
+#
+# 修復原因（跨日 MA240 斷線）：
+#   若以 today - N_days 計算 start，當排程在凌晨 00:00~05:00 觸發時，
+#   today 已翻為新的日曆日，而 5K 的實際夜盤資料橫跨昨日 15:00~今日 05:00，
+#   date-based 的切片會受限於「今天午夜 00:00 以後」的可用量。
+#   遇到連假（如三天連休）時，5 天內的交易日不足，會導致可供 MA240 計算的
+#   5K 棒數 < 330 根（MA240 = 240 + 顯示 90），使均線從圖表前端斷線。
+#
+#   以 now_tw - 336 小時（14 天）作為絕對時間錨點，無論在何時觸發，
+#   都能確保回溯涵蓋 330+ 根 5K（即使橫跨春節等長連假亦足夠）。
+#   336 小時切片約 ~6,720 根 1 分 K，記憶體約 0.7 MB，不造成 OOM。
+_MAX_LOOKBACK_HOURS_5MIN_FUTURES: int = 336   # 14 天 × 24 小時 = 336 小時
 
 # 60K 時框品種差異化回溯天數（日曆天）
 # TXFR1  ：全天盤每日 19 根，90 天 × ~63 交易日 = ~1197 根 → MA240 + 連假緩衝 ✓
@@ -938,7 +952,9 @@ class ShioajiDataFetcher:
             if "Datetime" in df.columns:
                 date_str = df["Datetime"].dt.strftime("%Y-%m-%d")
                 mask     = (date_str >= start) & (date_str <= end)
-                return df[mask].reset_index(drop=True)
+                # .copy() 確保切片與大型 cache DataFrame（90 天，~43k 列）完全切斷
+                # 記憶體連結，讓 GC 可在 fetcher._1min_cache = None 後立即回收快取。
+                return df[mask].reset_index(drop=True).copy()
             return df
 
         logger.debug(
@@ -1061,8 +1077,7 @@ class ShioajiDataFetcher:
 
         # ── Date range（強制使用 Asia/Taipei 時區計算）──────────────────────
         # 以 TW_TZ 當前時間為基準，確保跨午夜夜盤不因 UTC 偏移而漏抓。
-        # start 依時框固定回溯天數（_MAX_LOOKBACK_DAYS），嚴格限制 1 分 K
-        # 抓取量，防止單次 fetch 超過 10 萬列導致 OOM Killed。
+        # start 依時框固定回溯——嚴格限制 1 分 K 抓取量，防止 OOM Killed。
         now_tw = datetime.now(TW_TZ)
         today  = now_tw.date()
 
@@ -1071,12 +1086,21 @@ class ShioajiDataFetcher:
         if start is None:
             if timeframe == "60min":
                 # 60K 回溯天數按品種差異化：
-                #   TXFR1 (期貨)：60 天 → ~800 根 → MA240 完整
-                #   TSE/OTC (現貨)：120 天 → ~378 根 → MA240 完整
+                #   TXFR1 (期貨)：90 天 → ~1197 根 → MA240 完整
+                #   TSE/OTC (現貨)：150 天 → ~472 根 → MA240 完整
                 lookback = _MAX_LOOKBACK_60MIN_SPOT if self._is_spot else _MAX_LOOKBACK_60MIN_FUTURES
+                start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
+            elif timeframe == "5min" and not self._is_spot:
+                # ── 跨日夜盤修正：以「當前時刻 - 小時數」計算 start ──────────
+                # 以 today - N_days（午夜為錨點）計算時，凌晨 00:00 日期切換後，
+                # 夜盤資料（昨日 15:00~今日 05:00）的可用窗口被壓縮，
+                # 遇連假時 5K 棒數可能低於 330 根（MA240+顯示），導致 MA240 斷線。
+                # 改用 now_tw - 336h（14 天）為絕對時間錨點：任何時刻觸發都能
+                # 確保切片涵蓋 700+ 根 5K，OOM 影響可忽略（~0.7 MB 1 分 K）。
+                start = (now_tw - timedelta(hours=_MAX_LOOKBACK_HOURS_5MIN_FUTURES)).strftime("%Y-%m-%d")
             else:
                 lookback = _MAX_LOOKBACK_DAYS.get(timeframe, _MAX_LOOKBACK_DAYS_DEFAULT)
-            start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
+                start = (today - timedelta(days=lookback)).strftime("%Y-%m-%d")
 
         logger.info(
             "Fetching 1-min kbars: %s  %s → %s  (target: %d %s bars)",
