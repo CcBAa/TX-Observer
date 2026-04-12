@@ -7,7 +7,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Linux%20Headless-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![API](https://img.shields.io/badge/Data-Shioaji%20API-orange)
-![Push](https://img.shields.io/badge/Push-LINE%20Messaging%20API-brightgreen)
+![Push](https://img.shields.io/badge/Push-Discord%20%2B%20Telegram-blueviolet)
 
 ---
 
@@ -20,20 +20,20 @@ TX-Observer 是一套部署於無頭 Linux 伺服器的**全自動台股技術�
 ```
 Shioaji API 抓取 1-min 原始 K 棒
         ↓
-本地 Resample → 5分K + 60分K
+本地 Resample → 5分K / 60分K / 日K
         ↓
 matplotlib GridSpec 單一 Figure（含 MA5/10/20/60/240、十字線標記）
         ↓
-匯出單一 PNG（5K 上 56% / 共享 Legend / 60K 下 44%）
+匯出單一 PNG（期貨：60K 上 60% / 5K 下 40%；現貨：日K 上 56% / 60K 下 44%）
         ↓
-上傳 Imgbb 圖床取得公開 URL
+直接上傳至 Discord Webhook（multipart binary）
         ↓
-LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
+直接上傳至 Telegram Bot（sendPhoto binary）
         ↓
 刪除本地暫存 PNG
 ```
 
-> **設計原則**：全程無 GUI（Matplotlib Agg backend）、憑證僅從 `.env` 讀取、休市日完全不呼叫任何 API、台指期結算日自動提醒。
+> **設計原則**：全程無 GUI（Matplotlib Agg backend）、憑證僅從 `.env` 讀取、休市日完全不呼叫任何 API、台指期結算日自動提醒、不依賴外部圖床。
 
 ---
 
@@ -53,12 +53,26 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 
 每次觸發輸出一張單一 Figure 合圖（無需 Pillow 拼合）：
 
+**期貨模式（TXFR1）：**
+
 ```
 ┌─────────────────────────────────────┐
-│  [台指期近一]  5K                    │  ← 上圖（~56% 高度）
+│  [台指期近一]  60K                   │  ← 上圖（~60% 高度）
 │  蠟燭圖 + MA5/10/20/60/240           │
 ├──── MA5 ── MA10 ── MA20 ── MA60 ── MA240 ────┤  ← 共享 Legend
-│  [台指期近一]  60K                   │  ← 下圖（~44% 高度）
+│  [台指期近一]  5K                    │  ← 下圖（~40% 高度）
+│  蠟燭圖 + MA5/10/20/60/240           │
+└─────────────────────────────────────┘
+```
+
+**現貨模式（TSE/OTC）：**
+
+```
+┌─────────────────────────────────────┐
+│  [加權指數]  日K                     │  ← 上圖（~56% 高度）
+│  蠟燭圖 + MA5/10/20/60/240           │
+├──── MA5 ── MA10 ── MA20 ── MA60 ── MA240 ────┤  ← 共享 Legend
+│  [加權指數]  60K                     │  ← 下圖（~44% 高度）
 │  蠟燭圖 + MA5/10/20/60/240           │
 └─────────────────────────────────────┘
 ```
@@ -74,7 +88,7 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 | 解析度 | 300 DPI |
 | MA 線 | MA5（金）/ MA10（藍）/ MA20（粉）/ MA60（橙）/ MA240（白） |
 | 共享 Legend | 單一橫向 Legend 列置於兩張子圖之間，不重複顯示 |
-| 顯示窗口 | 5K：最新 90 根；60K：最新 65 根 |
+| 顯示窗口 | 5K：最新 90 根；60K：最新 65 根；日K：最新 45 根 |
 | 最高/最低標注 | 顯示窗口內最高 High（▲ 紅）與最低 Low（▼ 綠）自動標價 |
 | MA 計算 | 基於**完整資料集**計算後再截取顯示窗口，邊緣值準確 |
 | 渲染架構 | 單一 `matplotlib Figure` + `GridSpec`；mplfinance 外部 axes 模式，無需 Pillow 拼合 |
@@ -85,7 +99,7 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 
 - **第一層 — 行事曆層**：每天 08:30 透過 `pandas_market_calendars` XTAI 行事曆判斷今天是否開盤
   - 正確處理國定假日、農曆年、颱風停市、**週六補班開盤**
-  - 休市日所有任務直接跳過，完全不呼叫 Shioaji API 或 LINE
+  - 休市日所有任務直接跳過，完全不呼叫 Shioaji API 或推播
 
 - **第二層 — 時段層**：每個任務觸發時再次確認當前時間是否在交易時段內
 
@@ -94,18 +108,23 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 | 任務 | 觸發日 | 觸發時間 |
 |------|--------|---------|
 | 行事曆檢查 | 週一~六 | 08:30 |
-| 台指期（日盤） | 週一~五 | 08:45 · 09:45 · 10:45 · 11:45 · 12:45 · 13:45 |
+| 台指期（日盤） | 週一~五 | 08:45 · 09:45 · 10:45 · 11:45 · 12:45 |
+| 台指期（日盤收盤，retry×3） | 週一~五 | **13:45:10**（`【今日收盤總結】`） |
 | 台指期（夜盤前段） | 週一~五 | 15:00 · 16:00 · … · 23:00（每整點）|
-| 台指期（夜盤後段） | 週二~六 | 00:00 · 01:00 · … · 05:00（每整點）|
-| 加權 + 櫃買 | 週一~五 | 09:00 · 10:00 · 11:00 · 12:00 · 13:00 |
+| 台指期（夜盤後段） | 週二~六 | 00:00 · 01:00 · … · 04:00（每整點）|
+| 台指期（夜盤收盤，retry×3） | 週二~六 | **05:00:10**（`【今日收盤總結】`） |
+| 加權 + 櫃買（盤中） | 週一~五 | 09:00 · 10:00 · 11:00 · 12:00 · 13:00 |
+| 加權 + 櫃買（收盤，retry×3） | 週一~五 | **13:30:10**（`【今日收盤總結】`） |
+
+> **收盤補送設計**：收盤 job 延遲 10 秒觸發（確保交易所完成最後一根 K 棒），並內建最多 3 次重試（間隔 5 秒）以應對 API 資料延遲。
 
 ### 3. 台指期結算日自動提醒
 
 - 判斷邏輯：**每月第三個週三**（日期落在 15~21 日之間的週三）
-- 結算日當天台指期 LINE 訊息自動加上首行：`【今日台指結算日】`
+- 結算日當天台指期訊息自動加上首行：`【今日台指結算日】`
 - 僅影響 TXFR1；加權、櫃買訊息不受影響，仍正常推送
 
-**LINE 訊息格式（結算日範例）：**
+**訊息格式（結算日範例）：**
 
 ```
 【今日台指結算日】
@@ -113,21 +132,21 @@ LINE Messaging API Push（文字摘要 + 圖片，1 計費單位）
 台指期近一 (TXFR1)
 Last:        20,123
 Change:  ▲ 45  (+0.22%)
-Charts:  5K + 60K 合圖
+Charts:  60K + 5K 合圖
 ```
 
 ### 4. 進階 Resample 邏輯
 
-| 品種 | 5K Resample | 60K Resample |
-|------|-------------|--------------|
-| TXFR1 | `offset='45min'`（XQ 標準，以 08:45 為基準） | 日盤切點 `:46`，夜盤切點 `:01` |
-| TSE/OTC | 標準整點區間 | 切點 `:01`（首根 09:00 歸入 10:00 棒） |
+| 品種 | 5K Resample | 60K Resample | 日K Resample |
+|------|-------------|--------------|--------------|
+| TXFR1 | `offset='45min'`（XQ 標準，以 08:45 為基準） | 日盤切點 `:46`，夜盤切點 `:01` | — |
+| TSE/OTC | 標準整點區間 | 切點 `:01`（首根 09:00 歸入 10:00 棒） | 09:00–13:30 日內匯總 |
 
 Session 隔離：偵測超過 70 分鐘的時間空白自動切分 session，防止日盤與夜盤的 K 棒跨 session 合併。
 
 ### 5. 錯誤隔離
 
-單一品種失敗（抓取、繪圖、上傳、推送任一環節）只記錄 Error log，不影響其他品種繼續執行，排程器持續運作不崩潰。
+單一品種失敗（抓取、繪圖、上傳、推送任一環節）只記錄 Error log，不影響其他品種繼續執行，排程器持續運作不崩潰。Discord 與 Telegram 推播彼此獨立隔離，一方失敗不影響另一方。
 
 ### 6. CLI 測試工具
 
@@ -149,9 +168,9 @@ python main.py --run-now --symbol OTC/101
 TX-Observer/
 ├── main.py          # 主程式：排程控制、市場行事曆、結算日提醒、任務編排
 ├── config.py        # 配置模組：載入 .env、憑證驗證、Logging 初始化
-├── fetcher.py       # 資料模組：Shioaji API 單例、Resample、Session 隔離
+├── fetcher.py       # 資料模組：Shioaji API 單例、Resample、Session 隔離、MA 預計算
 ├── renderer.py      # 繪圖模組：mplfinance 暗色 K 線圖、GridSpec 單一 Figure、CJK 字體
-├── notifier.py      # 推播模組：Imgbb 上傳 + LINE Messaging API Push
+├── notifier.py      # 推播模組：Discord Webhook + Telegram Bot 雙平台推送
 ├── diagnose.py      # 診斷工具：環境、API 連線、字體等自我檢測
 ├── fonts/           # 自動建立：CJK 字體快取目錄（.gitignore 排除）
 ├── charts/          # 自動建立：暫存 PNG 圖片（推送後即刪除，.gitignore 排除）
@@ -171,8 +190,8 @@ TX-Observer/
 | Python | 3.10 或以上 |
 | 作業系統 | Linux（推薦 Oracle Cloud Ubuntu 22.04）|
 | 永豐金券商帳戶 | 已申請並開通 Shioaji API 權限 |
-| LINE Developers 帳號 | 已建立 Messaging API Channel |
-| Imgbb 帳號 | 免費申請，取得 API Key |
+| Discord 伺服器 | 已建立三個頻道（TX / TSE / OTC）並取得各 Webhook URL |
+| Telegram Bot | 已建立 Bot 並加入超級群組，設定三個論壇主題（Topics） |
 
 ---
 
@@ -200,7 +219,7 @@ pip install -r requirements.txt
 
 ### Step 4 — 安裝系統字體（Ubuntu 伺服器）
 
-確保中文標題能正確顯示，無需手動下載字體：
+確保中文標題能正確顯示：
 
 ```bash
 sudo apt-get install -y fonts-noto-cjk
@@ -212,17 +231,27 @@ sudo apt-get install -y fonts-noto-cjk
 
 ```bash
 cp .env.example .env
-nano .env   # 填入下方三組金鑰
+nano .env   # 填入下方各組金鑰
 ```
 
 編輯 `.env`：
 
 ```dotenv
+# Shioaji API
 SHIOAJI_API_KEY=<永豐金 API Key>
 SHIOAJI_SECRET_KEY=<永豐金 Secret Key>
-LINE_CHANNEL_ACCESS_TOKEN=<LINE Channel Access Token>
-LINE_TARGET_ID=<LINE 群組 ID 或個人 ID>
-IMGBB_API_KEY=<Imgbb API Key>
+
+# Discord Webhooks（各品種獨立頻道）
+DISCORD_WEBHOOK_TX=<台指期 Discord Webhook URL>
+DISCORD_WEBHOOK_TSE=<加權指數 Discord Webhook URL>
+DISCORD_WEBHOOK_OTC=<櫃買指數 Discord Webhook URL>
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=<Bot Token>
+TELEGRAM_CHAT_ID=<超級群組 Chat ID（負數）>
+TELEGRAM_THREAD_TX=<台指期論壇主題 ID>
+TELEGRAM_THREAD_TSE=<加權指數論壇主題 ID>
+TELEGRAM_THREAD_OTC=<櫃買指數論壇主題 ID>
 ```
 
 ### Step 6 — 驗證安裝
@@ -232,11 +261,12 @@ python main.py --run-now
 ```
 
 成功時 log 應依序出現：
+
 ```
 TX-Observer Starting
 All credentials loaded successfully.
-Shioaji API ready.
-今日台股開盤，排程任務正常執行。
+Shioaji API 登入成功。
+合約驗證通過：TXFR1 / TSE001 / OTC101 均已確認。
 [台指期近一] triggered at ...
 [台指期近一] Job completed successfully.
 ...
@@ -259,26 +289,25 @@ python main.py
 3. 取得 `API_KEY` 與 `SECRET_KEY`
 4. 詳細文件：https://sinotrade.github.io/
 
-### LINE Channel Access Token
+### Discord Webhook URL
 
-1. 前往 [LINE Developers Console](https://developers.line.biz/)
-2. 建立 Provider → 建立 Messaging API Channel
-3. 進入 Channel → **Basic settings** → **Channel access token** → Issue
-4. 複製長效型 Token（約 172 字元）
+1. 在 Discord 伺服器中，對目標頻道點右鍵 → **「編輯頻道」**
+2. 進入「整合」→「Webhook」→「建立 Webhook」
+3. 複製 Webhook URL（格式：`https://discord.com/api/webhooks/...`）
+4. 為 TX / TSE / OTC 三個品種各建立一個 Webhook（可同頻道或不同頻道）
 
-### LINE_TARGET_ID（群組或個人 ID）
+### Telegram Bot Token 與 Chat ID
 
-1. 在 Channel 設定中啟用 **Webhook**
-2. 將 Bot 加入目標 LINE 群組（或加好友）
-3. 對 Bot 發送任意一則訊息
-4. 從 Webhook 事件 payload 中取得：
-   - 群組推播：`source.groupId`（開頭為 `C`，共 33 字元）
-   - 個人推播：`source.userId`（開頭為 `U`，共 33 字元）
+1. 在 Telegram 搜尋 **@BotFather**，傳送 `/newbot` 建立 Bot
+2. 複製 Token（格式：`123456789:ABC-DEF...`）
+3. 將 Bot 加入目標**超級群組**並賦予發送訊息權限
+4. 呼叫 `https://api.telegram.org/bot<TOKEN>/getUpdates`，從回應取得 `chat.id`（負數）
 
-### Imgbb API Key
+### Telegram 論壇主題 ID（TELEGRAM_THREAD_*）
 
-1. 前往 [https://imgbb.com/](https://imgbb.com/) 免費註冊
-2. 右上角頭像 → **About** → **API** → 申請 API Key
+1. 在超級群組開啟「Topics」（論壇功能）並建立三個主題（TX / TSE / OTC）
+2. 傳送測試訊息後，呼叫 `getUpdates`
+3. 從回應的 `message_thread_id` 欄位取得各主題 ID
 
 ---
 
@@ -352,7 +381,9 @@ sudo journalctl -u tx-observer -f
 | `[台指期近一] 今日為台指期結算日。` | 每月第三個週三 |
 | `Futures outside trading hours — skipped.` | 觸發時間不在交易時段 |
 | `[XXX] Job completed successfully.` | 完整流程正常結束 |
-| `CJK font found at static path: ...` | 中文字體載入成功 |
+| `Discord upload OK (HTTP 200).` | Discord 推播成功 |
+| `Telegram upload OK (HTTP 200).` | Telegram 推播成功 |
+| `CJK font loaded from cache: ...` | 中文字體載入成功 |
 
 ---
 
@@ -360,7 +391,7 @@ sudo journalctl -u tx-observer -f
 
 | 保護項目 | 措施 |
 |---------|------|
-| 所有 API 金鑰 | 僅從 `.env` 讀取，程式碼中無任何硬編碼 |
+| 所有 API 金鑰 / Token / Webhook URL | 僅從 `.env` 讀取，程式碼中無任何硬編碼 |
 | `.env` 檔案 | 已加入 `.gitignore`，不會被 git 追蹤 |
 | 圖表 PNG | 推送後立即刪除，`charts/` 已加入 `.gitignore` |
 | Log 檔案 | `*.log` 已加入 `.gitignore` |
@@ -393,11 +424,16 @@ pip install shioaji[speed]
 pip install pandas-market-calendars
 ```
 
-**Q：LINE Push 回應 `403` 或 `401`**
+**Q：Discord 回應 `401` 或 `404`**
 
-- 確認 `LINE_CHANNEL_ACCESS_TOKEN` 未過期（長效型 Token 無到期日）
-- 確認 Bot 仍在目標群組中
-- 確認 `LINE_TARGET_ID` 格式正確（群組以 `C` 開頭）
+- 確認 Webhook URL 正確且未被刪除（Discord 伺服器管理者可重新產生）
+- 確認 `.env` 中的 `DISCORD_WEBHOOK_TX/TSE/OTC` 對應品種正確
+
+**Q：Telegram 回應 `400 Bad Request`**
+
+- 確認 `TELEGRAM_CHAT_ID` 為超級群組 ID（負數，格式 `-100xxxxxxxxxx`）
+- 確認 `TELEGRAM_THREAD_*` 為正確的論壇主題 ID
+- 確認 Bot 已加入群組且具備發送訊息權限
 
 **Q：要如何停止排程器？**
 
@@ -416,8 +452,7 @@ nohup：`kill $(cat tx_observer.pid)`
 | `pandas` / `numpy` | 資料處理與 Resample |
 | `mplfinance` | K 線圖繪製（外部 axes 模式） |
 | `matplotlib` | 圖形後端（Agg，無 GUI）+ GridSpec 版面 |
-| `Pillow` | 圖像處理（保留於依賴，主渲染流程已改用 GridSpec，不再拼合） |
-| `requests` | Imgbb 上傳 + LINE Push |
+| `requests` | Discord Webhook 上傳 + Telegram Bot API |
 | `APScheduler` | 多 Cron 排程器 |
 | `pytz` | Asia/Taipei 時區處理 |
 | `python-dotenv` | `.env` 環境變數載入 |
